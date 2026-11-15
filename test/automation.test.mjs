@@ -26,8 +26,16 @@ import {
   compileFlowToSpec,
   compileStepToCode,
   buildPlaywrightLocatorCode,
+  buildPlaywrightLocatorWithFallbacks,
   compileFlowFile,
 } from '../src/runner/compiler.mjs';
+
+import {
+  startRecording,
+  stopRecording,
+  getRecordingStatus,
+  deleteRecordingSession,
+} from '../src/recorder/recorder.mjs';
 
 import {
   compareImages,
@@ -160,6 +168,29 @@ test('3. Playwright Spec Compiler', async (t) => {
 
     const assertCode = compileStepToCode({ action: 'assert', selectorSet: { textSelector: 'Welcome' } }, 3);
     assert.match(assertCode, /await expect\(page\.getByText\("Welcome"\)\)\.toBeVisible\(\)/);
+
+    const selectCode = compileStepToCode({ action: 'select', selectorSet: { cssSelector: 'select#role' }, value: 'admin' }, 4);
+    assert.match(selectCode, /await page\.locator\("select#role"\)\.selectOption\("admin"\)/);
+
+    const checkCode = compileStepToCode({ action: 'check', selectorSet: { cssSelector: 'input#agree' } }, 5);
+    assert.match(checkCode, /await page\.locator\("input#agree"\)\.check\(\)/);
+
+    const uncheckCode = compileStepToCode({ action: 'uncheck', selectorSet: { cssSelector: 'input#agree' } }, 6);
+    assert.match(uncheckCode, /await page\.locator\("input#agree"\)\.uncheck\(\)/);
+  });
+
+  await t.test('buildPlaywrightLocatorWithFallbacks chains .or() locators', () => {
+    const code = buildPlaywrightLocatorWithFallbacks({
+      selectorSet: {
+        primarySelector: '[data-testid="submit-btn"]',
+        ariaSelector: { role: 'button', name: 'Submit' },
+        cssSelector: 'button#submit',
+      },
+    });
+    assert.equal(
+      code,
+      'page.getByTestId("submit-btn").or(page.getByRole("button", { name: "Submit" })).or(page.locator("button#submit"))'
+    );
   });
 
   await t.test('compileFlowToSpec produces complete, syntactically valid TypeScript test file', () => {
@@ -181,16 +212,19 @@ test('3. Playwright Spec Compiler', async (t) => {
     assert.match(spec, /await expect\(page\.getByText\("Dashboard"\)\)\.toBeVisible\(\)/);
   });
 
-  await t.test('compileFlowFile writes file to disk', () => {
+  await t.test('compileFlowFile writes file to disk and resolves directory', () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'compile-test-'));
-    const flowFile = path.join(tmpDir, 'flow.json');
-    const specFile = path.join(tmpDir, 'test.spec.ts');
+    const flowDir = path.join(tmpDir, 'my-flow');
+    fs.mkdirSync(flowDir);
+    const flowFile = path.join(flowDir, 'flow.json');
     fs.writeFileSync(flowFile, JSON.stringify({ name: 'disk-test', steps: [{ action: 'goto', url: 'http://test' }] }));
 
-    const res = compileFlowFile(flowFile, specFile);
+    // Test passing directory
+    const res = compileFlowFile(flowDir);
     assert.equal(res.ok, true);
-    assert.ok(fs.existsSync(specFile));
-    const content = fs.readFileSync(specFile, 'utf8');
+    const expectedSpec = path.join(flowDir, 'flow.spec.ts');
+    assert.ok(fs.existsSync(expectedSpec));
+    const content = fs.readFileSync(expectedSpec, 'utf8');
     assert.match(content, /await page\.goto\("http:\/\/test"/);
     fs.rmSync(tmpDir, { recursive: true });
   });
@@ -281,8 +315,52 @@ test('6. Tool Definitions & CLI Tool Runner', async (t) => {
   });
 
   await t.test('runTool handles automation_record_status when idle', async () => {
+    deleteRecordingSession();
     const res = await runTool('automation_record_status');
     assert.equal(res.ok, true);
     assert.match(res.text, /No active recording session/);
+  });
+
+  await t.test('startRecording, getRecordingStatus, and stopRecording lifecycle persists state', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rec-test-'));
+    deleteRecordingSession();
+
+    const mockSession = {
+      port: 9222,
+      page: {
+        url: () => 'https://example.com/shop',
+        exposeFunction: async () => {},
+        addInitScript: async () => {},
+        evaluate: async () => {},
+        goto: async () => {},
+      },
+    };
+
+    const startRes = await startRecording(mockSession, {
+      flowName: 'shopping-flow',
+      startUrl: 'https://example.com/shop',
+      cwd: tmpDir,
+    });
+    assert.equal(startRes.ok, true);
+
+    const statusRes = await getRecordingStatus({ session: mockSession });
+    assert.equal(statusRes.isRecording, true);
+    assert.equal(statusRes.flowName, 'shopping-flow');
+    assert.ok(statusRes.stepCount >= 1);
+
+    const stopRes = await stopRecording({ cwd: tmpDir, session: mockSession });
+    assert.equal(stopRes.ok, true);
+    assert.equal(stopRes.flowName, 'shopping-flow');
+    assert.ok(fs.existsSync(stopRes.flowFile));
+    assert.ok(fs.existsSync(stopRes.specFile));
+
+    const flowData = JSON.parse(fs.readFileSync(stopRes.flowFile, 'utf8'));
+    assert.equal(flowData.name, 'shopping-flow');
+    assert.ok(flowData.steps.length >= 1);
+
+    const idleStatus = await getRecordingStatus();
+    assert.equal(idleStatus.isRecording, false);
+
+    fs.rmSync(tmpDir, { recursive: true });
   });
 });

@@ -60,30 +60,97 @@ export function findSystemBrowserExecutable() {
   return null;
 }
 
+import { spawn } from 'node:child_process';
+
+const STANDALONE_PORT_FILE = path.join(os.homedir(), '.opscode', 'run', 'chrome-port');
+const STANDALONE_PROFILE_DIR = path.join(os.homedir(), '.local', 'share', 'opscode', 'standalone-profile');
+
+export function getStandaloneDevToolsPort() {
+  if (!fs.existsSync(STANDALONE_PORT_FILE)) return null;
+  try {
+    const port = parseInt(fs.readFileSync(STANDALONE_PORT_FILE, 'utf8').trim(), 10);
+    return Number.isFinite(port) && port > 0 ? port : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Launch detached standalone Chrome with CDP debugging port
+ */
+async function launchPersistentChrome(executablePath, port = 9222, headless = false) {
+  fs.mkdirSync(STANDALONE_PROFILE_DIR, { recursive: true });
+  fs.mkdirSync(path.dirname(STANDALONE_PORT_FILE), { recursive: true });
+
+  const args = [
+    `--remote-debugging-port=${port}`,
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--disable-dev-shm-usage',
+    `--user-data-dir=${STANDALONE_PROFILE_DIR}`,
+    '--window-size=1280,800',
+    'about:blank',
+  ];
+  if (headless) {
+    args.push('--headless=new');
+  }
+
+  const cp = spawn(executablePath, args, {
+    detached: true,
+    stdio: 'ignore',
+  });
+  cp.unref();
+
+  // Wait up to 3.5 seconds for CDP endpoint to become ready
+  for (let i = 0; i < 25; i++) {
+    await new Promise(r => setTimeout(r, 140));
+    if (await isCdpEndpointActive(port, 400)) {
+      fs.writeFileSync(STANDALONE_PORT_FILE, String(port), 'utf8');
+      return port;
+    }
+  }
+  return null;
+}
+
 /**
  * Acquire a Playwright browser session:
  * 1. Connects to Opscode's internal browser via CDP if active
- * 2. Falls back to launching standalone Chrome/Chromium
+ * 2. Connects to existing standalone Chrome CDP if active
+ * 3. Launches standalone Chrome with CDP if persistent is desired
+ * 4. Falls back to launching standard Playwright browser
  */
 export async function getBrowserSession(options = {}) {
   const {
     url,
     headless = process.env.HEADLESS === 'true',
     forceNewPage = false,
+    persistent = true,
   } = options;
 
-  const port = getOpscodeDevToolsPort();
-  const cdpActive = port ? await isCdpEndpointActive(port) : false;
+  // 1. Try Opscode internal browser
+  const opscodePort = options.port || getOpscodeDevToolsPort();
+  const opscodeActive = opscodePort ? await isCdpEndpointActive(opscodePort) : false;
 
-  if (cdpActive) {
+  // 2. Try existing standalone CDP port
+  const standalonePort = getStandaloneDevToolsPort() || 9222;
+  const standaloneActive = !opscodeActive && (await isCdpEndpointActive(standalonePort));
+
+  const activePort = opscodeActive ? opscodePort : (standaloneActive ? standalonePort : null);
+
+  if (activePort) {
     try {
-      const browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`);
+      const browser = await chromium.connectOverCDP(`http://127.0.0.1:${activePort}`);
       const contexts = browser.contexts();
       const context = contexts.length > 0 ? contexts[0] : await browser.newContext();
       let page;
       const pages = context.pages();
       if (!forceNewPage && pages.length > 0) {
-        page = pages[pages.length - 1];
+        if (url) {
+          const match = pages.find(p => p.url() === url || (url.startsWith('http') && p.url().startsWith(url)));
+          page = match || pages[pages.length - 1];
+        } else {
+          page = pages[pages.length - 1];
+        }
       } else {
         page = await context.newPage();
       }
@@ -100,17 +167,51 @@ export async function getBrowserSession(options = {}) {
         browser,
         context,
         page,
-        mode: 'opscode-cdp',
-        port,
+        mode: opscodeActive ? 'opscode-cdp' : 'standalone-cdp',
+        port: activePort,
         isCdp: true,
       };
     } catch (err) {
-      console.warn(`[CDP] Failed to connect to CDP port ${port}: ${err.message}. Falling back to standalone browser.`);
+      console.warn(`[CDP] Failed to connect to CDP port ${activePort}: ${err.message}. Falling back.`);
     }
   }
 
-  // Standalone fallback
+  // 3. Launch persistent standalone Chrome if executable available
   const executablePath = findSystemBrowserExecutable();
+  if (persistent && executablePath) {
+    try {
+      const launchedPort = await launchPersistentChrome(executablePath, 9222, headless);
+      if (launchedPort) {
+        const browser = await chromium.connectOverCDP(`http://127.0.0.1:${launchedPort}`);
+        const contexts = browser.contexts();
+        const context = contexts.length > 0 ? contexts[0] : await browser.newContext();
+        let page;
+        const pages = context.pages();
+        page = pages.length > 0 ? pages[pages.length - 1] : await context.newPage();
+
+        if (url && url !== 'about:blank') {
+          try {
+            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+          } catch (e) {
+            console.warn(`[Standalone-CDP] Initial navigation warning: ${e.message}`);
+          }
+        }
+
+        return {
+          browser,
+          context,
+          page,
+          mode: 'standalone-cdp',
+          port: launchedPort,
+          isCdp: true,
+        };
+      }
+    } catch (err) {
+      console.warn(`[Standalone-CDP] Detached launch notice: ${err.message}. Using standard launch.`);
+    }
+  }
+
+  // 4. In-process Playwright launch fallback
   const launchOptions = {
     headless,
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],

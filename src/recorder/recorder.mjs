@@ -1,22 +1,75 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import { getSidebarInjectionScript } from './sidebar.mjs';
 import { compileFlowToSpec } from '../runner/compiler.mjs';
+import { getBrowserSession } from '../cdp/session.mjs';
 
-// Global recording state
+const SESSION_FILE = path.join(os.homedir(), '.opscode', 'run', 'automation-session.json');
+
+// In-memory active recording session (if within same node process)
 let activeRecording = null;
+
+export function readRecordingSession() {
+  if (activeRecording && activeRecording.isRecording) {
+    return activeRecording;
+  }
+  if (!fs.existsSync(SESSION_FILE)) return null;
+  try {
+    const raw = fs.readFileSync(SESSION_FILE, 'utf8');
+    const data = JSON.parse(raw);
+    return data && data.isRecording ? data : null;
+  } catch {
+    return null;
+  }
+}
+
+export function writeRecordingSession(data) {
+  try {
+    fs.mkdirSync(path.dirname(SESSION_FILE), { recursive: true });
+    fs.writeFileSync(SESSION_FILE, JSON.stringify(data, null, 2), 'utf8');
+  } catch {}
+}
+
+export function deleteRecordingSession() {
+  try {
+    if (fs.existsSync(SESSION_FILE)) fs.unlinkSync(SESSION_FILE);
+  } catch {}
+}
 
 /**
  * Returns in-page DOM recorder JavaScript string
  */
-export function getRecorderInjectionScript() {
+export function getRecorderInjectionScript(flowName = '') {
   return `
 (function() {
   if (window.__opscodeRecorderInjected) return;
   window.__opscodeRecorderInjected = true;
 
-  let isPaused = false;
+  // Initialize or restore in-page state
+  if (!window.__opscodeRecordingState) {
+    try {
+      const saved = sessionStorage.getItem('__opscode_recording_state');
+      if (saved) window.__opscodeRecordingState = JSON.parse(saved);
+    } catch {}
+  }
+  if (!window.__opscodeRecordingState) {
+    window.__opscodeRecordingState = {
+      isRecording: true,
+      isPaused: false,
+      flowName: ${JSON.stringify(flowName)},
+      steps: [],
+      startTime: Date.now(),
+    };
+  }
+
   let lastUrl = location.href;
+
+  function persistState() {
+    try {
+      sessionStorage.setItem('__opscode_recording_state', JSON.stringify(window.__opscodeRecordingState));
+    } catch {}
+  }
 
   function isInsideSidebar(el) {
     if (!el) return false;
@@ -189,10 +242,23 @@ export function getRecorderInjectionScript() {
   }
 
   function recordStep(step) {
-    if (isPaused) return;
-    if (window.opscodeRecordStep) {
-      window.opscodeRecordStep(step);
+    if (window.__opscodeRecordingState && window.__opscodeRecordingState.isPaused) return;
+    if (!window.__opscodeRecordingState || !window.__opscodeRecordingState.isRecording) return;
+
+    window.__opscodeRecordingState.steps.push(step);
+    persistState();
+
+    // Immediately update in-page widget UI
+    if (window.__opscodeUpdateSidebar) {
+      window.__opscodeUpdateSidebar(window.__opscodeRecordingState.steps, window.__opscodeRecordingState.isPaused);
     }
+
+    // Also notify Node session if connected
+    try {
+      if (window.opscodeRecordStep) {
+        window.opscodeRecordStep(step);
+      }
+    } catch {}
   }
 
   // Click handler
@@ -220,15 +286,47 @@ export function getRecorderInjectionScript() {
     const tag = el.tagName.toLowerCase();
     if (tag === 'input' || tag === 'textarea' || tag === 'select') {
       const selectorSet = extractSelectorSet(el);
-      const val = el.type === 'checkbox' || el.type === 'radio' ? el.checked : el.value;
-      const desc = 'Fill ' + (tag === 'select' ? 'option ' : '') + '"' + String(val).slice(0, 30) + '" into ' + (el.name || el.id || tag);
-      recordStep({
-        action: el.type === 'checkbox' || el.type === 'radio' ? 'click' : 'fill',
-        selectorSet,
-        value: String(val),
-        description: desc,
-        timestamp: Date.now(),
-      });
+
+      if (tag === 'select') {
+        const val = el.value;
+        const text = el.selectedOptions && el.selectedOptions[0] ? el.selectedOptions[0].innerText.trim() : val;
+        const desc = 'Select "' + (text || val).slice(0, 30) + '" from ' + (el.name || el.id || 'dropdown');
+        recordStep({
+          action: 'select',
+          selectorSet,
+          value: String(val),
+          description: desc,
+          timestamp: Date.now(),
+        });
+      } else if (el.type === 'checkbox') {
+        const act = el.checked ? 'check' : 'uncheck';
+        const desc = (el.checked ? 'Check ' : 'Uncheck ') + (el.name || el.id || 'checkbox');
+        recordStep({
+          action: act,
+          selectorSet,
+          value: el.checked,
+          description: desc,
+          timestamp: Date.now(),
+        });
+      } else if (el.type === 'radio') {
+        recordStep({
+          action: 'click',
+          selectorSet,
+          value: el.value,
+          description: 'Select radio ' + (el.name || el.id || el.value),
+          timestamp: Date.now(),
+        });
+      } else {
+        const val = el.value;
+        const desc = 'Fill "' + String(val).slice(0, 30) + '" into ' + (el.name || el.id || tag);
+        recordStep({
+          action: 'fill',
+          selectorSet,
+          value: String(val),
+          description: desc,
+          timestamp: Date.now(),
+        });
+      }
     }
   }, true);
 
@@ -260,13 +358,6 @@ export function getRecorderInjectionScript() {
       });
     }
   }, 1000);
-
-  // Sidebar control listener
-  window.addEventListener('message', (e) => {
-    if (e.data && e.data.type === 'opscode-recorder-pause') {
-      isPaused = !!e.data.paused;
-    }
-  });
 })();
 `;
 }
@@ -275,15 +366,15 @@ export function getRecorderInjectionScript() {
  * Start an interactive recording session
  */
 export async function startRecording(session, options = {}) {
-  const { flowName = `flow-${Date.now()}`, startUrl } = options;
-
-  if (activeRecording && activeRecording.isRecording) {
+  const existing = readRecordingSession();
+  if (existing && existing.isRecording) {
     return {
       ok: false,
-      error: `Recording session already active for flow "${activeRecording.flowName}". Stop it first.`,
+      error: `Recording session already active for flow "${existing.flowName}". Stop it first.`,
     };
   }
 
+  const { flowName = `flow-${Date.now()}`, startUrl, cwd = process.cwd() } = options;
   const { page } = session;
 
   activeRecording = {
@@ -292,6 +383,8 @@ export async function startRecording(session, options = {}) {
     flowName,
     startUrl: startUrl || page.url(),
     startTime: Date.now(),
+    cwd,
+    port: session.port,
     steps: [],
     session,
   };
@@ -301,6 +394,7 @@ export async function startRecording(session, options = {}) {
     await page.exposeFunction('opscodeRecordStep', async (step) => {
       if (!activeRecording || !activeRecording.isRecording || activeRecording.isPaused) return;
       activeRecording.steps.push(step);
+      writeRecordingSession(activeRecording);
       try {
         await page.evaluate(({ steps, isPaused }) => {
           if (window.__opscodeUpdateSidebar) {
@@ -309,19 +403,20 @@ export async function startRecording(session, options = {}) {
         }, { steps: activeRecording.steps, isPaused: activeRecording.isPaused });
       } catch {}
     });
-  } catch {
-    // Function already exposed in this context
-  }
+  } catch {}
 
   try {
     await page.exposeFunction('opscodeSidebarAction', async (action) => {
       if (!activeRecording) return;
       if (action.type === 'pause') {
         activeRecording.isPaused = true;
+        writeRecordingSession(activeRecording);
       } else if (action.type === 'resume') {
         activeRecording.isPaused = false;
+        writeRecordingSession(activeRecording);
       } else if (action.type === 'undo') {
         activeRecording.steps.pop();
+        writeRecordingSession(activeRecording);
         try {
           await page.evaluate(({ steps, isPaused }) => {
             if (window.__opscodeUpdateSidebar) {
@@ -330,15 +425,13 @@ export async function startRecording(session, options = {}) {
           }, { steps: activeRecording.steps, isPaused: activeRecording.isPaused });
         } catch {}
       } else if (action.type === 'stop') {
-        await stopRecording();
+        await stopRecording({ cwd });
       }
     });
-  } catch {
-    // Function already exposed in this context
-  }
+  } catch {}
 
-  // Inject sidebar and recorder scripts on every navigation
-  const fullScript = getSidebarInjectionScript() + '\n' + getRecorderInjectionScript();
+  // Inject sidebar and recorder scripts on navigation
+  const fullScript = getSidebarInjectionScript() + '\n' + getRecorderInjectionScript(flowName);
   try {
     await page.addInitScript(fullScript);
   } catch {}
@@ -354,7 +447,7 @@ export async function startRecording(session, options = {}) {
     console.warn(`[Recorder] Immediate injection notice: ${err.message}`);
   }
 
-  // If startUrl was specified and differs from current page, navigate now
+  // Navigate to startUrl if specified
   if (startUrl && page.url() !== startUrl) {
     try {
       await page.goto(startUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
@@ -364,16 +457,10 @@ export async function startRecording(session, options = {}) {
         description: `Navigate to ${startUrl}`,
         timestamp: Date.now(),
       });
-      await page.evaluate(({ steps, isPaused }) => {
-        if (window.__opscodeUpdateSidebar) {
-          window.__opscodeUpdateSidebar(steps, isPaused);
-        }
-      }, { steps: activeRecording.steps, isPaused: activeRecording.isPaused });
     } catch (err) {
       console.warn(`[Recorder] Navigation error: ${err.message}`);
     }
   } else {
-    // Record current URL as initial step
     activeRecording.steps.push({
       action: 'goto',
       url: page.url(),
@@ -381,6 +468,22 @@ export async function startRecording(session, options = {}) {
       timestamp: Date.now(),
     });
   }
+
+  // Sync initial in-page state
+  try {
+    await page.evaluate(({ steps, flowName, isPaused }) => {
+      if (window.__opscodeRecordingState) {
+        window.__opscodeRecordingState.flowName = flowName;
+        window.__opscodeRecordingState.steps = steps;
+        window.__opscodeRecordingState.isPaused = isPaused;
+      }
+      if (window.__opscodeUpdateSidebar) {
+        window.__opscodeUpdateSidebar(steps, isPaused);
+      }
+    }, { steps: activeRecording.steps, flowName, isPaused: false });
+  } catch {}
+
+  writeRecordingSession(activeRecording);
 
   return {
     ok: true,
@@ -393,22 +496,46 @@ export async function startRecording(session, options = {}) {
 /**
  * Get the status of the active recording session
  */
-export function getRecordingStatus() {
-  if (!activeRecording || !activeRecording.isRecording) {
+export async function getRecordingStatus(options = {}) {
+  let rec = readRecordingSession();
+  if (!rec || !rec.isRecording) {
     return {
       isRecording: false,
       message: 'No active recording session.',
     };
   }
 
+  // Try to query active page in browser to sync any fresh in-page recorded steps
+  try {
+    const session = options.session || activeRecording?.session || await getBrowserSession({ persistent: false });
+    if (session?.page) {
+      const inPage = await session.page.evaluate(() => {
+        return window.__opscodeRecordingState
+          ? { steps: window.__opscodeRecordingState.steps, isPaused: window.__opscodeRecordingState.isPaused }
+          : null;
+      });
+      if (inPage && Array.isArray(inPage.steps)) {
+        const existingTs = new Set((rec.steps || []).map(s => s.timestamp));
+        for (const s of inPage.steps) {
+          if (s && s.timestamp && !existingTs.has(s.timestamp)) {
+            rec.steps.push(s);
+            existingTs.add(s.timestamp);
+          }
+        }
+        if (typeof inPage.isPaused === 'boolean') rec.isPaused = inPage.isPaused;
+        writeRecordingSession(rec);
+      }
+    }
+  } catch {}
+
   return {
     isRecording: true,
-    isPaused: activeRecording.isPaused,
-    flowName: activeRecording.flowName,
-    startUrl: activeRecording.startUrl,
-    durationMs: Date.now() - activeRecording.startTime,
-    stepCount: activeRecording.steps.length,
-    lastSteps: activeRecording.steps.slice(-5),
+    isPaused: !!rec.isPaused,
+    flowName: rec.flowName,
+    startUrl: rec.startUrl,
+    durationMs: Date.now() - (rec.startTime || Date.now()),
+    stepCount: (rec.steps || []).length,
+    lastSteps: (rec.steps || []).slice(-5),
   };
 }
 
@@ -416,27 +543,41 @@ export function getRecordingStatus() {
  * Stop recording, save flow.json, and compile standalone .spec.ts
  */
 export async function stopRecording(options = {}) {
-  if (!activeRecording || !activeRecording.isRecording) {
+  let rec = readRecordingSession();
+  if (!rec || !rec.isRecording) {
     return {
       ok: false,
       error: 'No active recording session to stop.',
     };
   }
 
-  const rec = activeRecording;
-  activeRecording = null;
-
-  // Attempt to remove sidebar from page
+  // Attempt to sync final in-page steps and remove sidebar widget
   try {
-    if (rec.session?.page) {
-      await rec.session.page.evaluate(() => {
+    const session = options.session || activeRecording?.session || await getBrowserSession({ persistent: false });
+    if (session?.page) {
+      const inPageSteps = await session.page.evaluate(() => {
+        const state = window.__opscodeRecordingState;
         const root = document.getElementById('opscode-recording-sidebar-root');
         if (root) root.remove();
+        try { sessionStorage.removeItem('__opscode_recording_state'); } catch {}
+        return state ? state.steps : [];
       });
+      if (Array.isArray(inPageSteps)) {
+        const existingTs = new Set((rec.steps || []).map(s => s.timestamp));
+        for (const s of inPageSteps) {
+          if (s && s.timestamp && !existingTs.has(s.timestamp)) {
+            rec.steps.push(s);
+            existingTs.add(s.timestamp);
+          }
+        }
+      }
     }
   } catch {}
 
-  const cwd = options.cwd || process.cwd();
+  activeRecording = null;
+  deleteRecordingSession();
+
+  const cwd = options.cwd || rec.cwd || process.cwd();
   const flowDir = path.resolve(cwd, 'automation', rec.flowName);
   fs.mkdirSync(flowDir, { recursive: true });
 
@@ -444,8 +585,8 @@ export async function stopRecording(options = {}) {
     name: rec.flowName,
     createdAt: new Date().toISOString(),
     startUrl: rec.startUrl,
-    stepCount: rec.steps.length,
-    steps: rec.steps,
+    stepCount: (rec.steps || []).length,
+    steps: rec.steps || [],
   };
 
   const flowFile = path.join(flowDir, 'flow.json');
@@ -459,9 +600,9 @@ export async function stopRecording(options = {}) {
   return {
     ok: true,
     flowName: rec.flowName,
-    stepCount: rec.steps.length,
+    stepCount: (rec.steps || []).length,
     flowFile,
     specFile,
-    message: `Recorded ${rec.steps.length} steps. Saved flow to ${path.relative(cwd, flowFile)} and compiled Playwright spec to ${path.relative(cwd, specFile)}.`,
+    message: `Recorded ${(rec.steps || []).length} steps. Saved flow to ${path.relative(cwd, flowFile)} and compiled Playwright spec to ${path.relative(cwd, specFile)}.`,
   };
 }

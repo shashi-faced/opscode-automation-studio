@@ -2,43 +2,71 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 /**
- * Builds the best Playwright locator expression for a step.
+ * Builds the best Playwright locator expression for a step, with optional selector fallbacks.
  */
-export function buildPlaywrightLocatorCode(step) {
+export function buildPlaywrightLocatorCode(step, options = {}) {
   const set = step.selectorSet || {};
+  const candidates = [];
+
   if (set.primarySelector) {
-    if (set.primarySelector.startsWith('[data-testid="')) {
+    if (set.primarySelector.startsWith('[data-testid="') && set.primarySelector.endsWith('"]')) {
       const id = set.primarySelector.slice(14, -2);
-      return `page.getByTestId(${JSON.stringify(id)})`;
+      candidates.push(`page.getByTestId(${JSON.stringify(id)})`);
+    } else {
+      candidates.push(`page.locator(${JSON.stringify(set.primarySelector)})`);
     }
-    return `page.locator(${JSON.stringify(set.primarySelector)})`;
   }
+
   if (set.ariaSelector && set.ariaSelector.role) {
     const opts = set.ariaSelector.name ? `, { name: ${JSON.stringify(set.ariaSelector.name)} }` : '';
-    return `page.getByRole(${JSON.stringify(set.ariaSelector.role)}${opts})`;
+    candidates.push(`page.getByRole(${JSON.stringify(set.ariaSelector.role)}${opts})`);
   }
+
   if (set.textSelector) {
-    return `page.getByText(${JSON.stringify(set.textSelector)})`;
+    candidates.push(`page.getByText(${JSON.stringify(set.textSelector)})`);
   }
+
   if (set.cssSelector) {
-    return `page.locator(${JSON.stringify(set.cssSelector)})`;
+    candidates.push(`page.locator(${JSON.stringify(set.cssSelector)})`);
   }
+
   if (set.xpathSelector) {
-    return `page.locator(${JSON.stringify('xpath=' + set.xpathSelector)})`;
+    candidates.push(`page.locator(${JSON.stringify('xpath=' + set.xpathSelector)})`);
   }
-  if (step.selector) {
-    return `page.locator(${JSON.stringify(step.selector)})`;
+
+  if (step.selector && !candidates.length) {
+    candidates.push(`page.locator(${JSON.stringify(step.selector)})`);
   }
-  return `page.locator('body')`;
+
+  if (!candidates.length) {
+    return `page.locator('body')`;
+  }
+
+  if (options.withFallbacks && candidates.length > 1) {
+    let expr = candidates[0];
+    for (let i = 1; i < candidates.length; i++) {
+      expr += `.or(${candidates[i]})`;
+    }
+    return expr;
+  }
+
+  return candidates[0];
+}
+
+/**
+ * Builds a locator expression with explicit selector fallbacks chained with .or()
+ */
+export function buildPlaywrightLocatorWithFallbacks(step) {
+  return buildPlaywrightLocatorCode(step, { withFallbacks: true });
 }
 
 /**
  * Compiles a single step into TypeScript Playwright lines.
  */
-export function compileStepToCode(step, index) {
+export function compileStepToCode(step, index, options = {}) {
   const act = (step.action || '').toLowerCase();
   const desc = step.description ? `// Step ${index + 1}: ${step.description}` : `// Step ${index + 1}: ${act}`;
-  const locatorCode = buildPlaywrightLocatorCode(step);
+  const locatorCode = buildPlaywrightLocatorCode(step, options);
 
   switch (act) {
     case 'goto':
@@ -52,6 +80,16 @@ export function compileStepToCode(step, index) {
     case 'fill': {
       const val = step.value ?? '';
       return `${desc}\n    await ${locatorCode}.fill(${JSON.stringify(val)});`;
+    }
+    case 'select': {
+      const val = step.value ?? '';
+      return `${desc}\n    await ${locatorCode}.selectOption(${JSON.stringify(val)});`;
+    }
+    case 'check': {
+      return `${desc}\n    await ${locatorCode}.check();`;
+    }
+    case 'uncheck': {
+      return `${desc}\n    await ${locatorCode}.uncheck();`;
     }
     case 'press': {
       const key = step.key || 'Enter';
@@ -80,12 +118,12 @@ export function compileStepToCode(step, index) {
 /**
  * Compiles an entire flow object or array of steps into a standalone Playwright spec file.
  */
-export function compileFlowToSpec(flowInput) {
+export function compileFlowToSpec(flowInput, options = {}) {
   const flow = typeof flowInput === 'string' ? JSON.parse(flowInput) : flowInput;
   const flowName = flow.name || 'recorded-flow';
   const steps = Array.isArray(flow.steps) ? flow.steps : [];
 
-  const stepCodes = steps.map((s, i) => compileStepToCode(s, i)).join('\n\n    ');
+  const stepCodes = steps.map((s, i) => compileStepToCode(s, i, options)).join('\n\n    ');
 
   return `import { test, expect } from '@playwright/test';
 
@@ -109,12 +147,16 @@ test.describe(${JSON.stringify(flowName)}, () => {
 /**
  * CLI or tool handler to compile a flow.json file on disk
  */
-export function compileFlowFile(flowFilePath, outSpecPath) {
-  const raw = fs.readFileSync(flowFilePath, 'utf8');
+export function compileFlowFile(flowFilePath, outSpecPath, options = {}) {
+  let resolved = flowFilePath;
+  if (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) {
+    resolved = path.join(resolved, 'flow.json');
+  }
+  const raw = fs.readFileSync(resolved, 'utf8');
   const flow = JSON.parse(raw);
-  const spec = compileFlowToSpec(flow);
+  const spec = compileFlowToSpec(flow, options);
 
-  const targetPath = outSpecPath || flowFilePath.replace(/\.json$/i, '.spec.ts');
+  const targetPath = outSpecPath || resolved.replace(/\.json$/i, '.spec.ts');
   fs.mkdirSync(path.dirname(targetPath), { recursive: true });
   fs.writeFileSync(targetPath, spec, 'utf8');
 

@@ -105,6 +105,34 @@ export const TOOL_DEFS = [
   },
 ];
 
+function resolveFlowPath(cwd, input) {
+  let p = path.resolve(cwd, input);
+  if (fs.existsSync(p)) {
+    if (fs.statSync(p).isDirectory()) {
+      const sub = path.join(p, 'flow.json');
+      if (fs.existsSync(sub)) return sub;
+    } else {
+      return p;
+    }
+  }
+  const candidates = [
+    path.resolve(cwd, 'automation', input, 'flow.json'),
+    path.resolve(cwd, 'automation', `${input}.json`),
+    path.resolve(cwd, `${input}.json`),
+  ];
+  for (const c of candidates) {
+    if (fs.existsSync(c)) {
+      if (fs.statSync(c).isDirectory()) {
+        const sub = path.join(c, 'flow.json');
+        if (fs.existsSync(sub)) return sub;
+      } else {
+        return c;
+      }
+    }
+  }
+  return null;
+}
+
 export async function runTool(name, params = {}, context = {}) {
   const cwd = context.cwd || process.cwd();
 
@@ -118,12 +146,14 @@ export async function runTool(name, params = {}, context = {}) {
         activeBrowserSession = await getBrowserSession({
           url: params.url,
           headless: false,
+          persistent: true,
         });
       }
 
       const res = await startRecording(activeBrowserSession, {
         flowName: params.flowName,
         startUrl: params.url,
+        cwd,
       });
 
       if (!res.ok) {
@@ -138,7 +168,8 @@ export async function runTool(name, params = {}, context = {}) {
     }
 
     case 'automation_record_stop': {
-      const res = await stopRecording({ cwd });
+      const res = await stopRecording({ cwd, session: activeBrowserSession });
+      activeBrowserSession = null;
       if (!res.ok) {
         return { ok: false, text: `Stop recording failed: ${res.error}` };
       }
@@ -151,7 +182,7 @@ export async function runTool(name, params = {}, context = {}) {
     }
 
     case 'automation_record_status': {
-      const status = getRecordingStatus();
+      const status = await getRecordingStatus({ session: activeBrowserSession });
       if (!status.isRecording) {
         return { ok: true, text: 'No active recording session is currently in progress.', data: status };
       }
@@ -169,14 +200,9 @@ export async function runTool(name, params = {}, context = {}) {
         return { ok: false, text: 'Missing required parameter "flow" (path to flow.json or flow name).' };
       }
 
-      let flowPath = path.resolve(cwd, params.flow);
-      if (!fs.existsSync(flowPath)) {
-        const candidate = path.resolve(cwd, 'automation', params.flow, 'flow.json');
-        if (fs.existsSync(candidate)) {
-          flowPath = candidate;
-        } else {
-          return { ok: false, text: `Flow file not found: ${params.flow}. Looked at ${flowPath} and ${candidate}.` };
-        }
+      const flowPath = resolveFlowPath(cwd, params.flow);
+      if (!flowPath) {
+        return { ok: false, text: `Flow file not found: ${params.flow}. Looked under ${cwd} and ${path.resolve(cwd, 'automation', params.flow)}.` };
       }
 
       const session = await getBrowserSession({
@@ -209,14 +235,12 @@ export async function runTool(name, params = {}, context = {}) {
         return { ok: false, text: 'Missing required parameter "flow" (path to flow.json).' };
       }
 
-      let flowPath = path.resolve(cwd, params.flow);
-      if (!fs.existsSync(flowPath)) {
-        const candidate = path.resolve(cwd, 'automation', params.flow, 'flow.json');
-        if (fs.existsSync(candidate)) flowPath = candidate;
-        else return { ok: false, text: `Flow file not found: ${params.flow}` };
+      const flowPath = resolveFlowPath(cwd, params.flow);
+      if (!flowPath) {
+        return { ok: false, text: `Flow file not found: ${params.flow}` };
       }
 
-      const res = compileFlowFile(flowPath, params.out ? path.resolve(cwd, params.out) : undefined);
+      const res = compileFlowFile(flowPath, params.out ? path.resolve(cwd, params.out) : undefined, { withFallbacks: true });
       return {
         ok: true,
         text: `Compiled ${res.stepCount} steps into Playwright spec: ${path.relative(cwd, res.specFile)}`,

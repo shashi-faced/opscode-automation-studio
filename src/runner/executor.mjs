@@ -8,8 +8,12 @@ import { SelectorResolver } from './resolver.mjs';
 export async function runFlow(session, flowInput, options = {}) {
   let flow;
   if (typeof flowInput === 'string') {
-    if (fs.existsSync(flowInput)) {
-      flow = JSON.parse(fs.readFileSync(flowInput, 'utf8'));
+    let resolved = flowInput;
+    if (fs.existsSync(resolved)) {
+      if (fs.statSync(resolved).isDirectory()) {
+        resolved = path.join(resolved, 'flow.json');
+      }
+      flow = JSON.parse(fs.readFileSync(resolved, 'utf8'));
     } else {
       flow = JSON.parse(flowInput);
     }
@@ -62,6 +66,33 @@ export async function runFlow(session, flowInput, options = {}) {
           healed = res.healed;
           healedStrategy = res.strategy || '';
           await res.locator.fill(String(step.value ?? ''), { timeout: 5000 });
+          break;
+        }
+
+        case 'select': {
+          const res = await resolver.resolve(page, step.selectorSet, step.description, step);
+          layerUsed = res.layerUsed;
+          healed = res.healed;
+          healedStrategy = res.strategy || '';
+          await res.locator.selectOption(String(step.value ?? ''), { timeout: 5000 });
+          break;
+        }
+
+        case 'check': {
+          const res = await resolver.resolve(page, step.selectorSet, step.description, step);
+          layerUsed = res.layerUsed;
+          healed = res.healed;
+          healedStrategy = res.strategy || '';
+          await res.locator.check({ timeout: 5000 });
+          break;
+        }
+
+        case 'uncheck': {
+          const res = await resolver.resolve(page, step.selectorSet, step.description, step);
+          layerUsed = res.layerUsed;
+          healed = res.healed;
+          healedStrategy = res.strategy || '';
+          await res.locator.uncheck({ timeout: 5000 });
           break;
         }
 

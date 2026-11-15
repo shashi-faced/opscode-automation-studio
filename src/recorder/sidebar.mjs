@@ -133,6 +133,10 @@ export function getSidebarInjectionScript() {
     }
     .step-card.click { border-left-color: #10b981; }
     .step-card.fill { border-left-color: #8b5cf6; }
+    .step-card.select { border-left-color: #06b6d4; }
+    .step-card.check { border-left-color: #10b981; }
+    .step-card.uncheck { border-left-color: #64748b; }
+    .step-card.press { border-left-color: #ec4899; }
     .step-card.goto { border-left-color: #3b82f6; }
     .step-card.scroll { border-left-color: #64748b; }
     .step-card.assert { border-left-color: #f59e0b; }
@@ -235,10 +239,14 @@ export function getSidebarInjectionScript() {
   btnPause.addEventListener('click', (e) => {
     e.stopPropagation();
     isPaused = !isPaused;
+    if (window.__opscodeRecordingState) {
+      window.__opscodeRecordingState.isPaused = isPaused;
+      try { sessionStorage.setItem('__opscode_recording_state', JSON.stringify(window.__opscodeRecordingState)); } catch {}
+    }
     dot.classList.toggle('paused', isPaused);
     btnPause.textContent = isPaused ? '▶' : '⏸';
     if (window.opscodeSidebarAction) {
-      window.opscodeSidebarAction({ type: isPaused ? 'pause' : 'resume' });
+      try { window.opscodeSidebarAction({ type: isPaused ? 'pause' : 'resume' }); } catch {}
     }
   });
 
@@ -251,15 +259,29 @@ export function getSidebarInjectionScript() {
 
   btnUndo.addEventListener('click', (e) => {
     e.stopPropagation();
+    if (window.__opscodeRecordingState && window.__opscodeRecordingState.steps && window.__opscodeRecordingState.steps.length > 0) {
+      window.__opscodeRecordingState.steps.pop();
+      try { sessionStorage.setItem('__opscode_recording_state', JSON.stringify(window.__opscodeRecordingState)); } catch {}
+      if (window.__opscodeUpdateSidebar) {
+        window.__opscodeUpdateSidebar(window.__opscodeRecordingState.steps, window.__opscodeRecordingState.isPaused);
+      }
+    }
     if (window.opscodeSidebarAction) {
-      window.opscodeSidebarAction({ type: 'undo' });
+      try { window.opscodeSidebarAction({ type: 'undo' }); } catch {}
     }
   });
 
   btnStop.addEventListener('click', (e) => {
     e.stopPropagation();
+    if (window.__opscodeRecordingState) {
+      window.__opscodeRecordingState.isRecording = false;
+      window.__opscodeRecordingState.stopped = true;
+      try { sessionStorage.setItem('__opscode_recording_state', JSON.stringify(window.__opscodeRecordingState)); } catch {}
+    }
+    btnStop.textContent = 'Saving...';
+    btnStop.disabled = true;
     if (window.opscodeSidebarAction) {
-      window.opscodeSidebarAction({ type: 'stop' });
+      try { window.opscodeSidebarAction({ type: 'stop' }); } catch {}
     }
   });
 

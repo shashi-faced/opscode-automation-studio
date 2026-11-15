@@ -178,7 +178,7 @@ export class SelectorResolver {
       try {
         const regionContainer = page.locator(domContext.region);
         if ((await regionContainer.count()) > 0) {
-          const scoped = locator.filter({ has: regionContainer });
+          const scoped = regionContainer.locator(locator);
           if ((await scoped.count()) === 1) return scoped;
         }
       } catch {}
@@ -192,7 +192,7 @@ export class SelectorResolver {
           exact: false,
         });
         if ((await heading.count()) > 0) {
-          const section = heading.locator('..');
+          const section = heading.locator('xpath=ancestor::section | ancestor::article | ancestor::main | ancestor::div[1]');
           const scoped = section.locator(locator);
           if ((await scoped.count()) === 1) return scoped;
         }
@@ -204,6 +204,8 @@ export class SelectorResolver {
       try {
         const lbl = page.locator(`label:has-text("${domContext.label}")`);
         if ((await lbl.count()) > 0) {
+          const scoped = lbl.locator(locator);
+          if ((await scoped.count()) === 1) return scoped;
           const inputInLabel = lbl.locator('input, textarea, select');
           if ((await inputInLabel.count()) === 1) return inputInLabel;
         }
