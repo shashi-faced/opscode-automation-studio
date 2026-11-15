@@ -7,6 +7,15 @@ import { compileFlowFile } from './runner/compiler.mjs';
 import { compareImages } from './runner/visual.mjs';
 import { auditPage } from './runner/audit.mjs';
 import { runDoctor } from './doctor.mjs';
+import {
+  loadProject,
+  saveProject,
+  updateCanvasLayout,
+  createFeature,
+  createFlow,
+  matchFlow,
+  batchRunFlows,
+} from './graph/project.mjs';
 
 // Active session holder for interactive recording
 let activeBrowserSession = null;
@@ -50,7 +59,7 @@ export const TOOL_DEFS = [
     parameters: {
       type: 'object',
       properties: {
-        flow: { type: 'string', description: 'Path to flow.json or flow name' },
+        flow: { type: 'string', description: 'Path to flow.json, flow ID or flow name' },
         continueOnError: { type: 'boolean', description: 'Whether to continue running remaining steps after a failure' },
         headless: { type: 'boolean', description: 'Run headlessly (default: false to view execution)' },
       },
@@ -103,9 +112,88 @@ export const TOOL_DEFS = [
       required: [],
     },
   },
+  {
+    name: 'automation_graph_get',
+    description: 'Retrieve the project automation hierarchy, features, flows, and interactive canvas layout from automation/project.json.',
+    parameters: {
+      type: 'object',
+      properties: {},
+      required: [],
+    },
+  },
+  {
+    name: 'automation_graph_save',
+    description: 'Save canvas viewport coordinates, node layout positions, and dependency edges to automation/project.json.',
+    parameters: {
+      type: 'object',
+      properties: {
+        canvasLayout: {
+          type: 'object',
+          description: 'Layout object containing viewport, node positions, and depends-on edges',
+        },
+      },
+      required: ['canvasLayout'],
+    },
+  },
+  {
+    name: 'automation_feature_create',
+    description: 'Add a new feature node to the project automation graph (e.g. "Authentication", "Catalog", "Checkout").',
+    parameters: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Name of the feature' },
+        description: { type: 'string', description: 'Optional descriptive summary of the feature' },
+      },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'automation_flow_create',
+    description: 'Create and link a new modular test flow under a feature, generating automation/features/<feature>/<flow>/flow.json and its Playwright spec.',
+    parameters: {
+      type: 'object',
+      properties: {
+        featureId: { type: 'string', description: 'ID or name of the parent feature' },
+        name: { type: 'string', description: 'Name of the test flow' },
+        description: { type: 'string', description: 'Optional description of the test flow' },
+        url: { type: 'string', description: 'Starting URL for this flow' },
+        steps: { type: 'array', description: 'Optional initial step definitions' },
+      },
+      required: ['featureId', 'name'],
+    },
+  },
+  {
+    name: 'automation_flow_match',
+    description: 'Fuzzy and semantic matching of user intent against saved features and flows. Returns confidence score (0.0 to 1.0) and top matching flow for deterministic reuse.',
+    parameters: {
+      type: 'object',
+      properties: {
+        intent: { type: 'string', description: 'User prompt or intent describing what to test or automate' },
+      },
+      required: ['intent'],
+    },
+  },
+  {
+    name: 'automation_batch_run',
+    description: 'Execute a batch of automation flows across features or following "depends-on" dependency edges, updating status and reporting step results.',
+    parameters: {
+      type: 'object',
+      properties: {
+        featureId: { type: 'string', description: 'Optional feature ID to run all flows under that feature' },
+        flowIds: { type: 'array', items: { type: 'string' }, description: 'Optional array of specific flow IDs to execute' },
+        followDependencies: { type: 'boolean', description: 'Whether to execute flows in topological dependency order (default: true)' },
+        continueOnError: { type: 'boolean', description: 'Whether to continue running subsequent flows if one fails (default: false)' },
+        headless: { type: 'boolean', description: 'Run headlessly (default: false)' },
+      },
+      required: [],
+    },
+  },
 ];
 
 function resolveFlowPath(cwd, input) {
+  if (!input) return null;
+
+  // Direct path
   let p = path.resolve(cwd, input);
   if (fs.existsSync(p)) {
     if (fs.statSync(p).isDirectory()) {
@@ -115,6 +203,25 @@ function resolveFlowPath(cwd, input) {
       return p;
     }
   }
+
+  // Check project.json for registered flow
+  try {
+    const projPath = path.resolve(cwd, 'automation', 'project.json');
+    if (fs.existsSync(projPath)) {
+      const proj = JSON.parse(fs.readFileSync(projPath, 'utf8'));
+      const inputNorm = String(input).toLowerCase();
+      for (const feat of proj.features || []) {
+        for (const fl of feat.flows || []) {
+          if (fl.id === input || fl.name.toLowerCase() === inputNorm || fl.id.toLowerCase() === inputNorm) {
+            const resolvedPath = path.resolve(cwd, fl.flowPath);
+            if (fs.existsSync(resolvedPath)) return resolvedPath;
+          }
+        }
+      }
+    }
+  } catch {}
+
+  // Check candidates under automation
   const candidates = [
     path.resolve(cwd, 'automation', input, 'flow.json'),
     path.resolve(cwd, 'automation', `${input}.json`),
@@ -130,6 +237,22 @@ function resolveFlowPath(cwd, input) {
       }
     }
   }
+
+  // Search recursively in automation/features
+  try {
+    const featuresDir = path.resolve(cwd, 'automation', 'features');
+    if (fs.existsSync(featuresDir)) {
+      const feats = fs.readdirSync(featuresDir);
+      for (const feat of feats) {
+        const subDir = path.join(featuresDir, feat, input);
+        if (fs.existsSync(subDir)) {
+          const fj = path.join(subDir, 'flow.json');
+          if (fs.existsSync(fj)) return fj;
+        }
+      }
+    }
+  } catch {}
+
   return null;
 }
 
@@ -174,9 +297,38 @@ export async function runTool(name, params = {}, context = {}) {
         return { ok: false, text: `Stop recording failed: ${res.error}` };
       }
 
+      // Auto-register flow under project graph if project exists or create default
+      try {
+        const project = loadProject(cwd);
+        let defaultFeat = project.features[0];
+        if (!defaultFeat) {
+          const featRes = createFeature(cwd, { name: 'General', description: 'Core user flows' });
+          defaultFeat = featRes.feature;
+        }
+        const relFlowPath = path.relative(cwd, res.flowFile);
+        const relSpecPath = path.relative(cwd, res.specFile);
+        const flowId = `flow-${res.flowName.toLowerCase().replace(/[^a-z0-9_-]+/g, '-')}`;
+
+        const existingFlow = defaultFeat.flows.find(f => f.flowPath === relFlowPath || f.id === flowId);
+        if (!existingFlow) {
+          defaultFeat.flows.push({
+            id: flowId,
+            name: res.flowName,
+            description: `Recorded journey at ${res.startUrl || ''}`,
+            flowPath: relFlowPath,
+            specPath: relSpecPath,
+            stepCount: res.stepCount,
+            lastRunStatus: 'idle',
+            lastRunDurationMs: 0,
+            lastRunAt: null,
+          });
+          saveProject(cwd, project);
+        }
+      } catch {}
+
       return {
         ok: true,
-        text: `⏹ Recording concluded for flow "${res.flowName}".\n- Steps recorded: ${res.stepCount}\n- Flow JSON: ${path.relative(cwd, res.flowFile)}\n- Playwright Spec: ${path.relative(cwd, res.specFile)}\n\nYou can now run this flow with automation_flow_run or edit the generated spec.`,
+        text: `⏹ Recording concluded for flow "${res.flowName}".\n- Steps recorded: ${res.stepCount}\n- Flow JSON: ${path.relative(cwd, res.flowFile)}\n- Playwright Spec: ${path.relative(cwd, res.specFile)}\n\nYou can now run this flow with automation_flow_run or inspect it on the graph.`,
         data: res,
       };
     }
@@ -197,12 +349,12 @@ export async function runTool(name, params = {}, context = {}) {
 
     case 'automation_flow_run': {
       if (!params.flow) {
-        return { ok: false, text: 'Missing required parameter "flow" (path to flow.json or flow name).' };
+        return { ok: false, text: 'Missing required parameter "flow" (path to flow.json, flow ID, or flow name).' };
       }
 
       const flowPath = resolveFlowPath(cwd, params.flow);
       if (!flowPath) {
-        return { ok: false, text: `Flow file not found: ${params.flow}. Looked under ${cwd} and ${path.resolve(cwd, 'automation', params.flow)}.` };
+        return { ok: false, text: `Flow file not found: ${params.flow}. Looked under ${cwd} and automation project graph.` };
       }
 
       const session = await getBrowserSession({
@@ -215,6 +367,22 @@ export async function runTool(name, params = {}, context = {}) {
           continueOnError: !!params.continueOnError,
           onProgress: context.onProgress,
         });
+
+        // Update project.json run status if registered
+        try {
+          const project = loadProject(cwd);
+          const relPath = path.relative(cwd, flowPath);
+          for (const feat of project.features) {
+            for (const fl of feat.flows || []) {
+              if (fl.flowPath === relPath || fl.id === params.flow || fl.name === params.flow) {
+                fl.lastRunStatus = res.ok ? 'pass' : 'fail';
+                fl.lastRunDurationMs = res.durationMs;
+                fl.lastRunAt = new Date().toISOString();
+              }
+            }
+          }
+          saveProject(cwd, project);
+        } catch {}
 
         const stepSummary = res.results.map(r => `  - Step ${r.stepIndex} [${r.action}]: ${r.status.toUpperCase()} (${r.durationMs}ms)${r.healed ? ' [Self-Healed: ' + r.healedStrategy + ']' : ''}${r.error ? ' -> ' + r.error : ''}`).join('\n');
 
@@ -304,6 +472,93 @@ export async function runTool(name, params = {}, context = {}) {
       return {
         ok: res.ok,
         text: `Automation Studio Doctor Diagnostics:\n\n${checkLines}\n\n${res.summary}`,
+        data: res,
+      };
+    }
+
+    case 'automation_graph_get': {
+      const project = loadProject(cwd);
+      const totalFlows = project.features.reduce((acc, f) => acc + (f.flows?.length || 0), 0);
+      return {
+        ok: true,
+        text: `Automation Graph loaded:\n- Project: "${project.name}" (ID: ${project.id})\n- Features: ${project.features.length}\n- Flows: ${totalFlows}\n- Canvas nodes: ${project.canvasLayout?.nodes?.length || 0}\n- Canvas edges: ${project.canvasLayout?.edges?.length || 0}`,
+        data: project,
+      };
+    }
+
+    case 'automation_graph_save': {
+      if (!params.canvasLayout || typeof params.canvasLayout !== 'object') {
+        return { ok: false, text: 'Missing required parameter "canvasLayout".' };
+      }
+      const project = updateCanvasLayout(cwd, params.canvasLayout);
+      return {
+        ok: true,
+        text: `Canvas layout saved: ${project.canvasLayout?.nodes?.length || 0} nodes, ${project.canvasLayout?.edges?.length || 0} edges.`,
+        data: project,
+      };
+    }
+
+    case 'automation_feature_create': {
+      if (!params.name) {
+        return { ok: false, text: 'Missing required parameter "name".' };
+      }
+      const res = createFeature(cwd, { name: params.name, description: params.description });
+      return {
+        ok: true,
+        text: `Feature "${res.feature.name}" (ID: ${res.feature.id}) added to automation graph.`,
+        data: res,
+      };
+    }
+
+    case 'automation_flow_create': {
+      if (!params.name || !params.featureId) {
+        return { ok: false, text: 'Missing required parameters "featureId" and/or "name".' };
+      }
+      const res = createFlow(cwd, {
+        featureId: params.featureId,
+        name: params.name,
+        description: params.description,
+        steps: params.steps,
+        url: params.url,
+      });
+      return {
+        ok: true,
+        text: `Flow "${res.flow.name}" (ID: ${res.flow.id}) created under feature "${res.feature.name}".\n- Flow JSON: ${res.flow.flowPath}\n- Spec: ${res.flow.specPath}`,
+        data: res,
+      };
+    }
+
+    case 'automation_flow_match': {
+      if (!params.intent) {
+        return { ok: false, text: 'Missing required parameter "intent".' };
+      }
+      const res = matchFlow(cwd, params.intent);
+      if (res.matched && res.flow) {
+        return {
+          ok: true,
+          text: `Found existing saved automation "${res.flow.name}" (${res.flow.stepCount} steps, confidence ${res.confidence}). Parent feature: "${res.flow.featureName}".`,
+          data: res,
+        };
+      }
+      return {
+        ok: true,
+        text: `No confident match found (top confidence: ${res.confidence}). Suggested candidate: ${res.flow ? res.flow.name : 'none'}.`,
+        data: res,
+      };
+    }
+
+    case 'automation_batch_run': {
+      const res = await batchRunFlows(cwd, {
+        featureId: params.featureId,
+        flowIds: params.flowIds,
+        followDependencies: params.followDependencies ?? true,
+        continueOnError: params.continueOnError ?? false,
+        headless: params.headless ?? false,
+        onProgress: context.onProgress,
+      });
+      return {
+        ok: res.ok,
+        text: res.summary,
         data: res,
       };
     }

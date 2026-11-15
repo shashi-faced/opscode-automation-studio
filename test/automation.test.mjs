@@ -303,6 +303,12 @@ test('6. Tool Definitions & CLI Tool Runner', async (t) => {
       'automation_visual_diff',
       'automation_audit',
       'automation_doctor',
+      'automation_graph_get',
+      'automation_graph_save',
+      'automation_feature_create',
+      'automation_flow_create',
+      'automation_flow_match',
+      'automation_batch_run',
     ];
     const names = TOOL_DEFS.map(t => t.name);
     assert.deepEqual(names.sort(), expected.sort());
@@ -363,4 +369,106 @@ test('6. Tool Definitions & CLI Tool Runner', async (t) => {
 
     fs.rmSync(tmpDir, { recursive: true });
   });
+});
+
+test('7. Automation Graph, Intent Matching & Batch Runner', async (t) => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'graph-test-'));
+
+  await t.test('automation_graph_get initializes valid default project structure', async () => {
+    const res = await runTool('automation_graph_get', {}, { cwd: tmpDir });
+    assert.equal(res.ok, true);
+    assert.ok(res.data);
+    assert.equal(res.data.id, 'default-project');
+    assert.ok(Array.isArray(res.data.features));
+    assert.ok(Array.isArray(res.data.canvasLayout.nodes));
+    assert.ok(Array.isArray(res.data.canvasLayout.edges));
+    assert.ok(fs.existsSync(path.join(tmpDir, 'automation', 'project.json')));
+  });
+
+  await t.test('automation_feature_create and automation_flow_create link hierarchy properly', async () => {
+    const featRes = await runTool('automation_feature_create', {
+      name: 'Authentication',
+      description: 'Sign-in and sign-up journeys',
+    }, { cwd: tmpDir });
+    assert.equal(featRes.ok, true);
+    assert.equal(featRes.data.feature.name, 'Authentication');
+
+    const flowRes = await runTool('automation_flow_create', {
+      featureId: featRes.data.feature.id,
+      name: 'User Login',
+      description: 'Login with username and password',
+      url: 'https://example.com/login',
+      steps: [
+        { action: 'goto', url: 'https://example.com/login', description: 'Navigate to login' },
+        { action: 'fill', selectorSet: { primarySelector: '#username' }, value: 'testuser', description: 'Type username' },
+        { action: 'fill', selectorSet: { primarySelector: '#password' }, value: 'secret123', description: 'Type password' },
+        { action: 'click', selectorSet: { primarySelector: 'button[type="submit"]' }, description: 'Click login button' },
+      ],
+    }, { cwd: tmpDir });
+
+    assert.equal(flowRes.ok, true);
+    assert.equal(flowRes.data.flow.name, 'User Login');
+    assert.equal(flowRes.data.flow.stepCount, 4);
+
+    const fullFlowPath = path.join(tmpDir, flowRes.data.flow.flowPath);
+    assert.ok(fs.existsSync(fullFlowPath), 'flow.json must exist');
+    const fullSpecPath = path.join(tmpDir, flowRes.data.flow.specPath);
+    assert.ok(fs.existsSync(fullSpecPath), 'Playwright spec must exist');
+
+    // Verify graph reflection
+    const graphRes = await runTool('automation_graph_get', {}, { cwd: tmpDir });
+    const flowNode = graphRes.data.canvasLayout.nodes.find(n => n.data.label === 'User Login');
+    assert.ok(flowNode, 'FlowNode must be present in canvasLayout');
+    assert.equal(flowNode.data.stepCount, 4);
+  });
+
+  await t.test('automation_graph_save persists custom positions and dependency edges', async () => {
+    const layout = {
+      viewport: { x: 100, y: 50, zoom: 1.2 },
+      nodes: [
+        { id: 'project:default-project', position: { x: 50, y: 50 } },
+      ],
+      edges: [
+        { id: 'edge-auth-checkout', source: 'flow:flow-user-login', target: 'flow:flow-checkout', type: 'depends-on' },
+      ],
+    };
+
+    const saveRes = await runTool('automation_graph_save', { canvasLayout: layout }, { cwd: tmpDir });
+    assert.equal(saveRes.ok, true);
+
+    const savedProject = JSON.parse(fs.readFileSync(path.join(tmpDir, 'automation', 'project.json'), 'utf8'));
+    assert.equal(savedProject.canvasLayout.viewport.zoom, 1.2);
+    const depEdge = savedProject.canvasLayout.edges.find(e => e.id === 'edge-auth-checkout');
+    assert.ok(depEdge, 'Dependency edge must be saved');
+    assert.equal(depEdge.type, 'depends-on');
+  });
+
+  await t.test('automation_flow_match matches prompt intents accurately', async () => {
+    // 1. High confidence match for user login
+    const match1 = await runTool('automation_flow_match', { intent: 'Please test the user login automation' }, { cwd: tmpDir });
+    assert.equal(match1.ok, true);
+    assert.equal(match1.data.matched, true);
+    assert.ok(match1.data.confidence >= 0.7, `Expected confidence >= 0.7, got ${match1.data.confidence}`);
+    assert.equal(match1.data.flow.name, 'User Login');
+
+    // 2. High confidence match for login keyword
+    const match2 = await runTool('automation_flow_match', { intent: 'login' }, { cwd: tmpDir });
+    assert.equal(match2.ok, true);
+    assert.equal(match2.data.matched, true);
+    assert.equal(match2.data.flow.name, 'User Login');
+
+    // 3. Unrelated prompt should not match
+    const match3 = await runTool('automation_flow_match', { intent: 'book a flight ticket to Paris' }, { cwd: tmpDir });
+    assert.equal(match3.ok, true);
+    assert.equal(match3.data.matched, false);
+    assert.ok(match3.data.confidence < 0.7);
+  });
+
+  await t.test('automation_batch_run handles empty or flow subsets gracefully', async () => {
+    const batchRes = await runTool('automation_batch_run', { featureId: 'non-existent-feat' }, { cwd: tmpDir });
+    assert.equal(batchRes.ok, true);
+    assert.equal(batchRes.data.totalFlows, 0);
+  });
+
+  fs.rmSync(tmpDir, { recursive: true });
 });

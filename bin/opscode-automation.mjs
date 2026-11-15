@@ -39,7 +39,10 @@ Commands:
   compile <flow.json>          Compile flow.json into Playwright test (.spec.ts)
   run <flow.json>              Replay flow with 5-layer self-healing and DOM scan
   diff <baseline> <current>    Pixelmatch visual regression diff
-  audit [url]                  WCAG 2.1 accessibility compliance check`;
+  audit [url]                  WCAG 2.1 accessibility compliance check
+  graph                        Retrieve project automation graph hierarchy
+  match '<intent>'             Fuzzy match user prompt to saved test flows
+  batch [--feature=<id>]       Batch run all flows or flows in feature`;
 
 async function main() {
   try {
@@ -92,6 +95,25 @@ async function main() {
 
       case 'run': {
         const r = await runTool('automation_flow_run', { flow: pos[0], continueOnError: !!flags.continue, headless: !!flags.headless }, { onProgress: progress });
+        return done(r, r.ok ? 0 : 1);
+      }
+
+      case 'graph': {
+        const r = await runTool('automation_graph_get', {}, { cwd: flags.cwd || process.cwd() });
+        return done(r, r.ok ? 0 : 1);
+      }
+
+      case 'match': {
+        const r = await runTool('automation_flow_match', { intent: pos[0] }, { cwd: flags.cwd || process.cwd() });
+        return done(r, r.ok ? 0 : 1);
+      }
+
+      case 'batch': {
+        const r = await runTool('automation_batch_run', {
+          featureId: flags.feature,
+          headless: !!flags.headless,
+          continueOnError: !!flags.continue,
+        }, { cwd: flags.cwd || process.cwd(), onProgress: progress });
         return done(r, r.ok ? 0 : 1);
       }
 
