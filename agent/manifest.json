@@ -1,0 +1,51 @@
+{
+  "id": "automation-studio",
+  "name": "Automation Studio Agent",
+  "icon": "🤖",
+  "version": "0.1.0",
+  "category": "dev",
+  "description": "Records browser user journeys, generates self-healing Playwright tests, runs visual diffs and WCAG accessibility audits in Opscode browser.",
+  "longDescription": "Record, test, and audit any web application directly in Opscode's built-in browser without needing external Chrome extensions.\n\n### Core Capabilities\n\n- **Zero-Extension In-Browser Recorder**: Injects an isolated Shadow DOM widget (#opscode-recording-sidebar-root) directly into Opscode's internal browser via CDP. Captures clicks, inputs, dropdowns, navigation, and multi-strategy locators.\n- **5-Layer Self-Healing Selector Engine**: Resiliently locates dynamic elements using Primary (data-testid/data-cy), Semantic ARIA roles, visible text, minimal unique CSS, and XPath, complete with contextual narrowing.\n- **Deterministic DOM Scanning Healing (Layer 6A)**: Automatically scans interactive DOM elements and recovers broken selectors matching the semantic description if traditional selectors break.\n- **Playwright Test Runner & Compiler**: Replays test flows with step-by-step progress tracking, auto-generates clean, human-readable Playwright test files (.spec.ts) with expect() assertions.\n- **Local Pixelmatch Visual Regression**: Compares baseline vs current screenshots, reporting changed pixel count, mismatch percentage, and highlighting discrepancies in diff images.\n- **Axe-Core WCAG Accessibility Audits**: Evaluates pages against WCAG 2.1 AA/AAA compliance offline, generating categorized violation reports with impact ratings and remediation guidelines.\n\n### Works natively with Opscode\nConnects directly to Opscode's embedded browser via DevToolsActivePort, enabling live recording and playback side-by-side with your code.",
+  "tags": [
+    "automation",
+    "testing",
+    "playwright",
+    "recorder",
+    "browser",
+    "qa",
+    "accessibility",
+    "visual-diff"
+  ],
+  "author": "Opscode",
+  "downloadSize": "~15 MB",
+  "samplePrompts": [
+    "🔴 Record a test flow on https://news.ycombinator.com",
+    "▶️ Run the recorded automation flow automation/login/flow.json",
+    "📦 Compile automation/login/flow.json into a standalone Playwright spec",
+    "👁️ Compare screenshots for visual regression between baseline.png and current.png",
+    "♿ Audit WCAG accessibility compliance for https://news.ycombinator.com"
+  ],
+  "allowedTools": [
+    "read_file",
+    "write_file",
+    "edit_file",
+    "list_directory",
+    "glob",
+    "ask_question",
+    "web_search",
+    "web_fetch",
+    "browser_navigate",
+    "browser_screenshot",
+    "browser_read",
+    "automation_record_start",
+    "automation_record_stop",
+    "automation_record_status",
+    "automation_flow_run",
+    "automation_flow_compile",
+    "automation_visual_diff",
+    "automation_audit",
+    "automation_doctor"
+  ],
+  "systemPrompt": "You are Automation Studio, an agent dedicated to browser test automation, end-to-end testing, visual regression diffing, and WCAG accessibility auditing.\n\nYou interact with web applications through Opscode's internal browser via Playwright and Chrome DevTools Protocol (CDP). No external Chrome extension is required.\n\n### How to work:\n1. **Recording Journeys**:\n   - When asked to record a test flow, call `automation_record_start` with the URL and a descriptive `flowName`.\n   - An in-page floating Shadow DOM widget (#opscode-recording-sidebar-root) appears in the browser with Pause, Undo, and Stop buttons.\n   - The user or you can interact with the page. You can monitor progress with `automation_record_status`.\n   - When finished, call `automation_record_stop` to conclude recording, save `automation/<flowName>/flow.json`, and compile `<flowName>.spec.ts`.\n\n2. **Running Automation Flows**:\n   - Call `automation_flow_run` with the flow path (e.g. `automation/login/flow.json`).\n   - The runner executes each step using the 5-layer self-healing selector resolver (Primary, ARIA, Text, CSS, XPath) and Layer 6A deterministic DOM scanning.\n   - Report step execution breakdown and whether self-healing was applied.\n\n3. **Compiling Specs**:\n   - Call `automation_flow_compile` to generate clean, idiomatic Playwright TypeScript `.spec.ts` files with `expect()` assertions.\n\n4. **Visual Regression**:\n   - Call `automation_visual_diff` with `baseline` and `current` screenshot paths. It computes pixel differences using pixelmatch and highlights discrepancies.\n\n5. **Accessibility Audits**:\n   - Call `automation_audit` with the target URL or active page to run an axe-core WCAG 2.1 compliance check, summarizing violations by severity.\n\nKeep your messages concise and actionable. Do the work with tools rather than merely describing it.",
+  "inputPlaceholder": "Describe what to record or automate: URL, test flow, visual diff, accessibility audit…"
+}
