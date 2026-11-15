@@ -15,7 +15,11 @@ export async function runFlow(session, flowInput, options = {}) {
       }
       flow = JSON.parse(fs.readFileSync(resolved, 'utf8'));
     } else {
-      flow = JSON.parse(flowInput);
+      try {
+        flow = JSON.parse(flowInput);
+      } catch {
+        throw new Error(`Flow file not found: ${flowInput}`);
+      }
     }
   } else {
     flow = flowInput;

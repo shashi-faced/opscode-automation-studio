@@ -12,17 +12,46 @@ function slugify(text) {
     .replace(/^-+|-+$/g, '') || 'item';
 }
 
+const SYNONYMS = {
+  login: ['login', 'signin', 'auth', 'authenticate', 'account', 'credential', 'credentials'],
+  logout: ['logout', 'signout'],
+  signup: ['signup', 'register', 'registration'],
+  checkout: ['checkout', 'payment', 'pay', 'order', 'purchase', 'buy'],
+  cart: ['cart', 'basket', 'bag'],
+  search: ['search', 'find', 'query', 'lookup'],
+  audit: ['audit', 'accessibility', 'a11y', 'wcag'],
+  diff: ['diff', 'pixelmatch', 'visual', 'screenshot', 'regression'],
+};
+
+function getCanonicalToken(word) {
+  for (const [canon, syns] of Object.entries(SYNONYMS)) {
+    if (canon === word || syns.includes(word)) return canon;
+  }
+  return word;
+}
+
 function normalizeTokens(str) {
   if (!str) return [];
   const STOP_WORDS = new Set([
     'run', 'the', 'test', 'automation', 'flow', 'please', 'a', 'an', 'to', 'for',
-    'in', 'on', 'with', 'and', 'do', 'of', 'at', 'by', 'from', 'again', 'now', 'rerun'
+    'in', 'on', 'with', 'and', 'do', 'of', 'at', 'by', 'from', 'again', 'now', 'rerun',
+    'can', 'you', 'my', 'our', 'me', 'this', 'that', 'our', 'it', 'is'
   ]);
-  return String(str)
+  const phraseNormalized = String(str)
     .toLowerCase()
+    .replace(/\blog\s+in\b/g, 'login')
+    .replace(/\bsign\s+in\b/g, 'login')
+    .replace(/\blog\s+out\b/g, 'logout')
+    .replace(/\bsign\s+out\b/g, 'logout')
+    .replace(/\bsign\s+up\b/g, 'signup')
+    .replace(/\bcheck\s+out\b/g, 'checkout')
+    .replace(/\badd\s+to\s+cart\b/g, 'add cart');
+
+  return phraseNormalized
     .replace(/[^a-z0-9\s_-]/g, ' ')
     .split(/[\s_-]+/)
-    .filter(t => t.length > 1 && !STOP_WORDS.has(t));
+    .filter(t => t.length > 1 && !STOP_WORDS.has(t))
+    .map(getCanonicalToken);
 }
 
 /**
@@ -116,10 +145,11 @@ export function computeGraphLayout(project) {
   });
 
   // Preserve any saved dependency edges (depends-on)
-  const savedDeps = (project.canvasLayout?.edges || []).filter(e => e.type === 'depends-on');
+  const savedDeps = (project.canvasLayout?.edges || []).filter(e => e.type === 'depends-on' || e.id?.startsWith('dep-'));
   for (const dep of savedDeps) {
     edges.push({
       ...dep,
+      type: 'depends-on',
       animated: true,
       style: dep.style || { stroke: '#3b82f6', strokeWidth: 2 },
     });
@@ -232,10 +262,12 @@ export function updateCanvasLayout(cwd, layout) {
   }
 
   if (Array.isArray(layout.edges)) {
-    const dependsOnEdges = layout.edges.filter(e => e.type === 'depends-on');
+    const dependsOnEdges = layout.edges
+      .filter(e => e.type === 'depends-on' || e.id?.startsWith('dep-'))
+      .map(e => ({ ...e, type: 'depends-on' }));
     // Replace dependency edges while preserving hierarchy
     project.canvasLayout.edges = [
-      ...project.canvasLayout.edges.filter(e => e.type !== 'depends-on'),
+      ...project.canvasLayout.edges.filter(e => e.type !== 'depends-on' && !e.id?.startsWith('dep-')),
       ...dependsOnEdges,
     ];
   }
@@ -353,13 +385,14 @@ export function createFlow(cwd, { featureId, name, description = '', steps = [],
  * Fuzzy matches user intent to existing saved features and flows
  */
 export function matchFlow(cwd, intent) {
-  if (!intent || typeof intent !== 'string') {
+  if (!intent || typeof intent !== 'string' || !intent.trim()) {
     return { matched: false, confidence: 0, flow: null, candidates: [] };
   }
 
   const project = loadProject(cwd);
-  const intentNorm = intent.toLowerCase().trim();
-  const intentTokens = normalizeTokens(intent);
+  const intentTrimmed = intent.trim();
+  const intentNorm = intentTrimmed.toLowerCase();
+  const intentTokens = normalizeTokens(intentTrimmed);
 
   const candidates = [];
 
@@ -371,29 +404,45 @@ export function matchFlow(cwd, intent) {
       const reasons = [];
 
       const flowNameNorm = flow.name.toLowerCase().trim();
-      const flowTokens = normalizeTokens(flow.name + ' ' + (flow.description || ''));
+      const flowNameTokens = normalizeTokens(flow.name);
+      const flowDescTokens = normalizeTokens(flow.description || '');
+      const allFlowTokens = [...new Set([...flowNameTokens, ...flowDescTokens])];
 
       // 1. Exact or strong substring match
       if (flowNameNorm === intentNorm) {
         score = 1.0;
         reasons.push('exact flow name match');
-      } else if (intentNorm.includes(flowNameNorm) && flowNameNorm.length >= 4) {
+      } else if (intentNorm.includes(flowNameNorm) && flowNameNorm.length >= 3) {
         score = Math.max(score, 0.95);
         reasons.push('intent contains full flow name');
-      } else if (flowNameNorm.includes(intentNorm) && intentNorm.length >= 4) {
-        score = Math.max(score, 0.9);
+      } else if (flowNameNorm.includes(intentNorm) && intentNorm.length >= 3) {
+        score = Math.max(score, 0.90);
         reasons.push('flow name contains full intent');
       } else {
-        // 2. Token overlap with flow name and description
-        if (intentTokens.length > 0 && flowTokens.length > 0) {
-          const matchCount = intentTokens.filter(t => flowTokens.some(ft => ft === t || ft.includes(t) || t.includes(ft))).length;
-          const jaccard = matchCount / (new Set([...intentTokens, ...flowTokens]).size);
-          const coverage = matchCount / intentTokens.length;
+        // 2. Flow name keyword coverage (how much of the flow's name is in the intent)
+        const matchedFlowNameTokens = flowNameTokens.filter(ft =>
+          intentTokens.some(it => it === ft || (it.length >= 4 && ft.length >= 4 && (it.includes(ft) || ft.includes(it))))
+        );
+        const flowNameCoverage = flowNameTokens.length > 0 ? matchedFlowNameTokens.length / flowNameTokens.length : 0;
 
-          const tokenScore = (jaccard * 0.4) + (coverage * 0.6);
+        // Intent tokens matching any flow tokens
+        const matchedIntentTokens = intentTokens.filter(it =>
+          allFlowTokens.some(ft => it === ft || (it.length >= 4 && ft.length >= 4 && (it.includes(ft) || ft.includes(it))))
+        );
+        const intentCoverage = intentTokens.length > 0 ? matchedIntentTokens.length / intentTokens.length : 0;
+
+        if (flowNameCoverage === 1.0) {
+          score = Math.max(score, 0.88);
+          reasons.push('all flow name keywords matched');
+        } else if (flowNameCoverage >= 0.5) {
+          score = Math.max(score, 0.75 + (intentCoverage * 0.15));
+          reasons.push(`primary flow keyword matched (${matchedFlowNameTokens.join(',')})`);
+        } else if (matchedIntentTokens.length > 0) {
+          const jaccard = matchedIntentTokens.length / (new Set([...intentTokens, ...allFlowTokens]).size);
+          const tokenScore = (jaccard * 0.4) + (intentCoverage * 0.5);
           if (tokenScore > score) {
             score = tokenScore;
-            reasons.push(`token overlap (${matchCount} matching words)`);
+            reasons.push(`token overlap (${matchedIntentTokens.length} matching words)`);
           }
         }
 
@@ -410,7 +459,7 @@ export function matchFlow(cwd, intent) {
                 if (intentTokens.length > 0 && stepMatches > 0) {
                   const stepCoverage = (stepMatches / intentTokens.length) * 0.75;
                   if (stepCoverage > score) {
-                    score = stepCoverage;
+                    score = Math.min(0.85, score + stepCoverage * 0.5);
                     reasons.push(`matches ${stepMatches} step action keywords`);
                   }
                 }
@@ -420,8 +469,9 @@ export function matchFlow(cwd, intent) {
         }
 
         // 4. Feature context boost
-        if (intentTokens.some(t => featTokens.includes(t))) {
-          score = Math.min(1.0, score + 0.15);
+        const matchedFeat = intentTokens.filter(it => featTokens.some(ft => ft === it || (it.length >= 4 && ft.length >= 4 && (it.includes(ft) || ft.includes(it)))));
+        if (matchedFeat.length > 0 && score > 0) {
+          score = Math.min(1.0, score + 0.12);
           reasons.push('matches parent feature context');
         }
       }
@@ -551,7 +601,27 @@ export async function batchRunFlows(cwd, options = {}) {
     ? orderFlowsByDependencies(targetFlows, project.canvasLayout?.edges || [])
     : targetFlows;
 
-  const session = await getBrowserSession({ headless: !!headless });
+  let session;
+  try {
+    session = await getBrowserSession({ headless: !!headless });
+  } catch (err) {
+    return {
+      ok: false,
+      summary: `Failed to acquire browser session: ${err.message}`,
+      totalFlows: runSequence.length,
+      passedFlows: 0,
+      failedFlows: runSequence.length,
+      results: runSequence.map(f => ({
+        flowId: f.id,
+        flowName: f.name,
+        ok: false,
+        status: 'fail',
+        durationMs: 0,
+        summary: err.message,
+      })),
+    };
+  }
+
   const results = [];
   let passedCount = 0;
   let failedCount = 0;
@@ -576,21 +646,30 @@ export async function batchRunFlows(cwd, options = {}) {
       }
 
       let res;
-      try {
-        res = await runFlow(session, fullFlowPath, {
-          cwd,
-          continueOnError,
-          onProgress: (p) => {
-            if (onProgress) onProgress({ ...p, flowId: flow.id, flowName: flow.name });
-          },
-        });
-      } catch (err) {
+      if (!fs.existsSync(fullFlowPath)) {
         res = {
           ok: false,
-          summary: err.message,
+          summary: `Flow file not found: ${flow.flowPath}`,
           durationMs: 0,
           results: [],
         };
+      } else {
+        try {
+          res = await runFlow(session, fullFlowPath, {
+            cwd,
+            continueOnError,
+            onProgress: (p) => {
+              if (onProgress) onProgress({ ...p, flowId: flow.id, flowName: flow.name });
+            },
+          });
+        } catch (err) {
+          res = {
+            ok: false,
+            summary: err.message,
+            durationMs: 0,
+            results: [],
+          };
+        }
       }
 
       const status = res.ok ? 'pass' : 'fail';

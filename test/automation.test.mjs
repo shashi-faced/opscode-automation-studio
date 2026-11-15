@@ -293,7 +293,7 @@ test('5. Automation Studio Doctor', async () => {
 });
 
 test('6. Tool Definitions & CLI Tool Runner', async (t) => {
-  await t.test('TOOL_DEFS defines all 8 tools with valid parameters', () => {
+  await t.test('TOOL_DEFS defines all 14 tools with valid parameters', () => {
     const expected = [
       'automation_record_start',
       'automation_record_stop',
@@ -457,11 +457,35 @@ test('7. Automation Graph, Intent Matching & Batch Runner', async (t) => {
     assert.equal(match2.data.matched, true);
     assert.equal(match2.data.flow.name, 'User Login');
 
-    // 3. Unrelated prompt should not match
-    const match3 = await runTool('automation_flow_match', { intent: 'book a flight ticket to Paris' }, { cwd: tmpDir });
+    // 3. Real-world natural prompt with descriptive words (credentials, staging)
+    const match3 = await runTool('automation_flow_match', { intent: 'Run the login test on staging with credentials' }, { cwd: tmpDir });
     assert.equal(match3.ok, true);
-    assert.equal(match3.data.matched, false);
-    assert.ok(match3.data.confidence < 0.7);
+    assert.equal(match3.data.matched, true);
+    assert.ok(match3.data.confidence >= 0.7);
+    assert.equal(match3.data.flow.name, 'User Login');
+
+    // 4. Two-word phrase normalization (log in, sign in)
+    const match4 = await runTool('automation_flow_match', { intent: 'log in to the account' }, { cwd: tmpDir });
+    assert.equal(match4.ok, true);
+    assert.equal(match4.data.matched, true);
+    assert.ok(match4.data.confidence >= 0.7);
+
+    const match5 = await runTool('automation_flow_match', { intent: 'sign in with user admin' }, { cwd: tmpDir });
+    assert.equal(match5.ok, true);
+    assert.equal(match5.data.matched, true);
+    assert.ok(match5.data.confidence >= 0.7);
+
+    // 5. Unrelated prompt should not match
+    const match6 = await runTool('automation_flow_match', { intent: 'book a flight ticket to Paris' }, { cwd: tmpDir });
+    assert.equal(match6.ok, true);
+    assert.equal(match6.data.matched, false);
+    assert.ok(match6.data.confidence < 0.7);
+
+    // 6. Empty / whitespace intent
+    const match7 = await runTool('automation_flow_match', { intent: '   ' }, { cwd: tmpDir });
+    assert.equal(match7.ok, true);
+    assert.equal(match7.data.matched, false);
+    assert.equal(match7.data.confidence, 0);
   });
 
   await t.test('automation_batch_run handles empty or flow subsets gracefully', async () => {

@@ -357,9 +357,14 @@ export async function runTool(name, params = {}, context = {}) {
         return { ok: false, text: `Flow file not found: ${params.flow}. Looked under ${cwd} and automation project graph.` };
       }
 
-      const session = await getBrowserSession({
-        headless: params.headless ?? false,
-      });
+      let session;
+      try {
+        session = await getBrowserSession({
+          headless: params.headless ?? false,
+        });
+      } catch (err) {
+        return { ok: false, text: `Failed to connect to browser session: ${err.message}` };
+      }
 
       try {
         const res = await runFlow(session, flowPath, {

@@ -89,12 +89,12 @@ async function main() {
       }
 
       case 'compile': {
-        const r = await runTool('automation_flow_compile', { flow: pos[0], out: flags.out });
+        const r = await runTool('automation_flow_compile', { flow: pos[0], out: flags.out }, { cwd: flags.cwd || process.cwd(), onProgress: progress });
         return done(r, r.ok ? 0 : 1);
       }
 
       case 'run': {
-        const r = await runTool('automation_flow_run', { flow: pos[0], continueOnError: !!flags.continue, headless: !!flags.headless }, { onProgress: progress });
+        const r = await runTool('automation_flow_run', { flow: pos[0], continueOnError: !!flags.continue, headless: !!flags.headless }, { cwd: flags.cwd || process.cwd(), onProgress: progress });
         return done(r, r.ok ? 0 : 1);
       }
 
@@ -118,12 +118,12 @@ async function main() {
       }
 
       case 'diff': {
-        const r = await runTool('automation_visual_diff', { baseline: pos[0], current: pos[1], outDiff: flags.out, threshold: flags.threshold ? +flags.threshold : undefined });
+        const r = await runTool('automation_visual_diff', { baseline: pos[0], current: pos[1], outDiff: flags.out, threshold: flags.threshold ? +flags.threshold : undefined }, { cwd: flags.cwd || process.cwd() });
         return done(r, r.ok ? 0 : 1);
       }
 
       case 'audit': {
-        const r = await runTool('automation_audit', { url: pos[0] });
+        const r = await runTool('automation_audit', { url: pos[0] }, { cwd: flags.cwd || process.cwd() });
         return done(r, r.ok ? 0 : 1);
       }
 
