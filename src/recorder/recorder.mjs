@@ -597,6 +597,57 @@ export async function stopRecording(options = {}) {
   const specFile = path.join(flowDir, `${rec.flowName}.spec.ts`);
   fs.writeFileSync(specFile, specCode, 'utf8');
 
+  // Update automation/project.json so the new flow appears on the visual graph
+  try {
+    const projectFile = path.resolve(cwd, 'automation', 'project.json');
+    let project = null;
+    if (fs.existsSync(projectFile)) {
+      project = JSON.parse(fs.readFileSync(projectFile, 'utf8'));
+    }
+    if (!project || !Array.isArray(project.features)) {
+      project = {
+        id: 'proj-' + path.basename(cwd),
+        name: 'Automation Studio',
+        baseUrl: rec.startUrl || 'http://localhost:3000',
+        canvasLayout: { viewport: { x: 0, y: 0, zoom: 1 }, nodes: [], edges: [] },
+        features: [],
+      };
+    }
+    const targetFeatureName = options.featureName || 'Recorded Flows';
+    let feat = project.features.find(f => f.name.toLowerCase() === targetFeatureName.toLowerCase() || f.id === options.featureId);
+    if (!feat) {
+      feat = {
+        id: 'feat-' + targetFeatureName.toLowerCase().replace(/[^a-z0-9_-]+/g, '-'),
+        name: targetFeatureName,
+        description: 'Recorded automation features',
+        flows: [],
+      };
+      project.features.push(feat);
+    }
+    const flowId = 'flow-' + rec.flowName;
+    const relFlow = path.relative(cwd, flowFile);
+    const relSpec = path.relative(cwd, specFile);
+    const existingIdx = feat.flows.findIndex(fl => fl.id === flowId || fl.name === rec.flowName);
+    const flowEntry = {
+      id: flowId,
+      name: rec.flowName,
+      description: `Automated flow starting at ${rec.startUrl || ''}`,
+      flowPath: relFlow,
+      specPath: relSpec,
+      stepCount: (rec.steps || []).length,
+      lastRunStatus: 'idle',
+      lastRunAt: new Date().toISOString(),
+    };
+    if (existingIdx >= 0) {
+      feat.flows[existingIdx] = { ...feat.flows[existingIdx], ...flowEntry };
+    } else {
+      feat.flows.push(flowEntry);
+    }
+    fs.writeFileSync(projectFile, JSON.stringify(project, null, 2), 'utf8');
+  } catch (err) {
+    console.warn(`[Recorder] Notice updating project.json: ${err.message}`);
+  }
+
   return {
     ok: true,
     flowName: rec.flowName,
