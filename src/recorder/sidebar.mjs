@@ -273,6 +273,13 @@ export function getSidebarInjectionScript() {
 
   btnStop.addEventListener('click', (e) => {
     e.stopPropagation();
+    try {
+      if (typeof window.__opscodeFlushAllInputs === 'function') {
+        window.__opscodeFlushAllInputs();
+      } else if (typeof window.__opscodeFlushActiveInput === 'function') {
+        window.__opscodeFlushActiveInput();
+      }
+    } catch {}
     if (window.__opscodeRecordingState) {
       window.__opscodeRecordingState.isRecording = false;
       window.__opscodeRecordingState.stopped = true;

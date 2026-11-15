@@ -27,7 +27,9 @@ export function readRecordingSession() {
 export function writeRecordingSession(data) {
   try {
     fs.mkdirSync(path.dirname(SESSION_FILE), { recursive: true });
-    fs.writeFileSync(SESSION_FILE, JSON.stringify(data, null, 2), 'utf8');
+    // Exclude live Playwright session object which contains circular references
+    const { session, ...persistable } = data || {};
+    fs.writeFileSync(SESSION_FILE, JSON.stringify(persistable, null, 2), 'utf8');
   } catch {}
 }
 
@@ -262,9 +264,81 @@ export function getRecorderInjectionScript(flowName = '') {
     } catch {}
   }
 
+  let inputDebounceTimer = null;
+  let lastFocusedInput = null;
+
+  function flushElementInput(el) {
+    if (!el || isInsideSidebar(el)) return;
+    const tag = (el.tagName || '').toLowerCase();
+    if (tag !== 'input' && tag !== 'textarea') return;
+    const type = (el.type || '').toLowerCase();
+    if (type === 'checkbox' || type === 'radio' || type === 'submit' || type === 'button' || type === 'file' || type === 'reset') return;
+
+    const val = el.value || '';
+    if (el.__opscodeLastRecordedValue === val) return;
+    if (val === '' && el.__opscodeLastRecordedValue === undefined) return;
+
+    el.__opscodeLastRecordedValue = val;
+    const selectorSet = extractSelectorSet(el);
+    const label = el.name || el.id || el.getAttribute('placeholder') || tag;
+    const displayVal = type === 'password' ? '••••••••' : (val.length > 30 ? val.slice(0, 30) + '...' : val);
+
+    recordStep({
+      action: 'fill',
+      selectorSet,
+      value: String(val),
+      description: 'Fill "' + displayVal + '" into ' + label,
+      timestamp: Date.now(),
+    });
+  }
+
+  function flushActiveInput() {
+    try {
+      let active = document.activeElement;
+      while (active && active.shadowRoot && active.shadowRoot.activeElement) {
+        active = active.shadowRoot.activeElement;
+      }
+      if (active) {
+        flushElementInput(active);
+      }
+    } catch {}
+  }
+
+  function flushAllInputs() {
+    try {
+      flushActiveInput();
+      if (lastFocusedInput) {
+        flushElementInput(lastFocusedInput);
+      }
+      const inputs = document.querySelectorAll('input, textarea');
+      for (let i = 0; i < inputs.length; i++) {
+        flushElementInput(inputs[i]);
+      }
+    } catch {}
+  }
+  window.__opscodeFlushActiveInput = flushAllInputs;
+  window.__opscodeFlushAllInputs = flushAllInputs;
+
+  // Track focused inputs & immediately flush on blur/focusout
+  document.addEventListener('focusin', function(e) {
+    if (isInsideSidebar(e.target)) return;
+    const tag = (e.target.tagName || '').toLowerCase();
+    if (tag === 'input' || tag === 'textarea') {
+      lastFocusedInput = e.target;
+    }
+  }, true);
+
+  document.addEventListener('focusout', function(e) {
+    if (isInsideSidebar(e.target)) return;
+    flushElementInput(e.target);
+  }, true);
+
   // Click handler
   document.addEventListener('click', function(e) {
     if (isInsideSidebar(e.target)) return;
+    clearTimeout(inputDebounceTimer);
+    flushAllInputs();
+
     const target = e.target.closest('button, a, input, [role="button"], [role="link"], select, textarea, div[onclick]') || e.target;
     if (isInsideSidebar(target)) return;
 
@@ -280,7 +354,21 @@ export function getRecorderInjectionScript(flowName = '') {
     });
   }, true);
 
-  // Change / Input handler for form controls
+  // Debounced input tracker for text inputs & textareas
+  document.addEventListener('input', function(e) {
+    if (isInsideSidebar(e.target)) return;
+    const el = e.target;
+    const tag = (el.tagName || '').toLowerCase();
+    if (tag === 'input' || tag === 'textarea') {
+      lastFocusedInput = el;
+      clearTimeout(inputDebounceTimer);
+      inputDebounceTimer = setTimeout(function() {
+        flushElementInput(el);
+      }, 400);
+    }
+  }, true);
+
+  // Change handler for form controls
   document.addEventListener('change', function(e) {
     if (isInsideSidebar(e.target)) return;
     const el = e.target;
@@ -318,15 +406,8 @@ export function getRecorderInjectionScript(flowName = '') {
           timestamp: Date.now(),
         });
       } else {
-        const val = el.value;
-        const desc = 'Fill "' + String(val).slice(0, 30) + '" into ' + (el.name || el.id || tag);
-        recordStep({
-          action: 'fill',
-          selectorSet,
-          value: String(val),
-          description: desc,
-          timestamp: Date.now(),
-        });
+        clearTimeout(inputDebounceTimer);
+        flushElementInput(el);
       }
     }
   }, true);
@@ -335,6 +416,9 @@ export function getRecorderInjectionScript(flowName = '') {
   document.addEventListener('keydown', function(e) {
     if (isInsideSidebar(e.target)) return;
     if (e.key === 'Enter') {
+      clearTimeout(inputDebounceTimer);
+      flushAllInputs();
+
       const el = e.target;
       const selectorSet = extractSelectorSet(el);
       recordStep({
@@ -345,6 +429,24 @@ export function getRecorderInjectionScript(flowName = '') {
         timestamp: Date.now(),
       });
     }
+  }, true);
+
+  // Form submit handler
+  document.addEventListener('submit', function(e) {
+    if (isInsideSidebar(e.target)) return;
+    clearTimeout(inputDebounceTimer);
+    flushAllInputs();
+  }, true);
+
+  // Navigation / Page unload flush
+  window.addEventListener('beforeunload', function() {
+    clearTimeout(inputDebounceTimer);
+    flushAllInputs();
+  }, true);
+
+  window.addEventListener('pagehide', function() {
+    clearTimeout(inputDebounceTimer);
+    flushAllInputs();
   }, true);
 
   // URL monitor
@@ -375,7 +477,7 @@ export async function startRecording(session, options = {}) {
     };
   }
 
-  const { flowName = `flow-${Date.now()}`, startUrl, cwd = process.cwd() } = options;
+  const { flowName = `flow-${Date.now()}`, startUrl, cwd = process.cwd(), featureName = null, featureId = null } = options;
   const { page } = session;
 
   let normStartUrl = startUrl;
@@ -390,6 +492,8 @@ export async function startRecording(session, options = {}) {
     startUrl: normStartUrl || page.url(),
     startTime: Date.now(),
     cwd,
+    featureName: featureName || null,
+    featureId: featureId || null,
     port: session.port,
     steps: [],
     session,
@@ -575,11 +679,38 @@ export async function stopRecording(options = {}) {
     for (const page of pages) {
       try {
         const inPageSteps = await page.evaluate(() => {
+          try {
+            if (typeof window.__opscodeFlushAllInputs === 'function') {
+              window.__opscodeFlushAllInputs();
+            } else if (typeof window.__opscodeFlushActiveInput === 'function') {
+              window.__opscodeFlushActiveInput();
+            }
+          } catch {}
+
+          let savedSteps = [];
+          try {
+            const raw = sessionStorage.getItem('__opscode_recording_state');
+            if (raw) {
+              const parsed = JSON.parse(raw);
+              if (parsed && Array.isArray(parsed.steps)) {
+                savedSteps = parsed.steps;
+              }
+            }
+          } catch {}
+
           const state = window.__opscodeRecordingState;
           const root = document.getElementById('opscode-recording-sidebar-root');
           if (root) root.remove();
           try { sessionStorage.removeItem('__opscode_recording_state'); } catch {}
-          return state ? state.steps : [];
+
+          const winSteps = (state && Array.isArray(state.steps)) ? state.steps : [];
+          const stepMap = new Map();
+          for (const s of [...savedSteps, ...winSteps]) {
+            if (s && s.timestamp) {
+              stepMap.set(s.timestamp, s);
+            }
+          }
+          return Array.from(stepMap.values());
         });
         if (Array.isArray(inPageSteps)) {
           const existingTs = new Set((rec.steps || []).map(s => s.timestamp));
@@ -646,21 +777,45 @@ export async function stopRecording(options = {}) {
         features: [],
       };
     }
-    const targetFeatureName = options.featureName || 'Recorded Flows';
-    let feat = project.features.find(f => f.name.toLowerCase() === targetFeatureName.toLowerCase() || f.id === options.featureId);
-    if (!feat) {
-      feat = {
-        id: 'feat-' + targetFeatureName.toLowerCase().replace(/[^a-z0-9_-]+/g, '-'),
-        name: targetFeatureName,
-        description: 'Recorded automation features',
-        flows: [],
-      };
-      project.features.push(feat);
+
+    const targetFeatureId = options.featureId || rec.featureId || null;
+    const targetFeatureName = options.featureName || rec.featureName || null;
+    let feat = null;
+    if (targetFeatureId) {
+      feat = project.features.find(f => f.id === targetFeatureId);
     }
-    const flowId = 'flow-' + rec.flowName;
+    if (!feat && targetFeatureName && targetFeatureName.toLowerCase() !== 'recorded flows') {
+      feat = project.features.find(f => f.name.toLowerCase() === targetFeatureName.toLowerCase());
+    }
+    if (!feat) {
+      if (project.features.length > 0) {
+        feat = project.features[0];
+      } else {
+        const featName = targetFeatureName || 'Authentication';
+        feat = {
+          id: targetFeatureId || ('feat-' + featName.toLowerCase().replace(/[^a-z0-9_-]+/g, '-')),
+          name: featName,
+          description: 'Recorded automation features',
+          flows: [],
+        };
+        project.features.push(feat);
+      }
+    }
+
+    // Clean up flow id to avoid double 'flow-' prefix
+    const cleanName = rec.flowName.replace(/^flow-+/i, '');
+    const flowId = 'flow-' + (cleanName || rec.flowName).toLowerCase().replace(/[^a-z0-9_-]+/g, '-');
     const relFlow = path.relative(cwd, flowFile);
     const relSpec = path.relative(cwd, specFile);
-    const existingIdx = feat.flows.findIndex(fl => fl.id === flowId || fl.name === rec.flowName);
+
+    // Remove any duplicate instances of this flow from other features
+    for (const otherFeat of project.features) {
+      if (otherFeat !== feat && Array.isArray(otherFeat.flows)) {
+        otherFeat.flows = otherFeat.flows.filter(fl => fl.id !== flowId && fl.flowPath !== relFlow && fl.id !== 'flow-' + rec.flowName);
+      }
+    }
+
+    const existingIdx = feat.flows.findIndex(fl => fl.id === flowId || fl.name === rec.flowName || fl.id === 'flow-' + rec.flowName);
     const flowEntry = {
       id: flowId,
       name: rec.flowName,

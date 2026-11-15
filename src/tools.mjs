@@ -29,6 +29,8 @@ export const TOOL_DEFS = [
       properties: {
         url: { type: 'string', description: 'The web page URL to record (e.g. "https://news.ycombinator.com" or "http://localhost:5173")' },
         flowName: { type: 'string', description: 'A descriptive name for the test flow (e.g. "login-flow", "checkout-journey")' },
+        featureName: { type: 'string', description: 'Optional feature group name to assign this flow under' },
+        featureId: { type: 'string', description: 'Optional feature group ID to assign this flow under' },
       },
       required: ['url'],
     },
@@ -40,6 +42,8 @@ export const TOOL_DEFS = [
       type: 'object',
       properties: {
         flowName: { type: 'string', description: 'Optional flow name override' },
+        featureName: { type: 'string', description: 'Optional feature group name to assign this flow under' },
+        featureId: { type: 'string', description: 'Optional feature group ID to assign this flow under' },
       },
       required: [],
     },
@@ -282,6 +286,8 @@ export async function runTool(name, params = {}, context = {}) {
         flowName: params.flowName || params.name,
         startUrl: recordUrl,
         cwd,
+        featureName: params.featureName || null,
+        featureId: params.featureId || null,
       });
 
       if (!res.ok) {
@@ -296,40 +302,16 @@ export async function runTool(name, params = {}, context = {}) {
     }
 
     case 'automation_record_stop': {
-      const res = await stopRecording({ cwd, session: activeBrowserSession });
+      const res = await stopRecording({
+        cwd,
+        session: activeBrowserSession,
+        featureName: params.featureName || null,
+        featureId: params.featureId || null,
+      });
       activeBrowserSession = null;
       if (!res.ok) {
         return { ok: false, text: `Stop recording failed: ${res.error}` };
       }
-
-      // Auto-register flow under project graph if project exists or create default
-      try {
-        const project = loadProject(cwd);
-        let defaultFeat = project.features[0];
-        if (!defaultFeat) {
-          const featRes = createFeature(cwd, { name: 'General', description: 'Core user flows' });
-          defaultFeat = featRes.feature;
-        }
-        const relFlowPath = path.relative(cwd, res.flowFile);
-        const relSpecPath = path.relative(cwd, res.specFile);
-        const flowId = `flow-${res.flowName.toLowerCase().replace(/[^a-z0-9_-]+/g, '-')}`;
-
-        const existingFlow = defaultFeat.flows.find(f => f.flowPath === relFlowPath || f.id === flowId);
-        if (!existingFlow) {
-          defaultFeat.flows.push({
-            id: flowId,
-            name: res.flowName,
-            description: `Recorded journey at ${res.startUrl || ''}`,
-            flowPath: relFlowPath,
-            specPath: relSpecPath,
-            stepCount: res.stepCount,
-            lastRunStatus: 'idle',
-            lastRunDurationMs: 0,
-            lastRunAt: null,
-          });
-          saveProject(cwd, project);
-        }
-      } catch {}
 
       return {
         ok: true,

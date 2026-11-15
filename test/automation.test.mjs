@@ -35,6 +35,7 @@ import {
   stopRecording,
   getRecordingStatus,
   deleteRecordingSession,
+  getRecorderInjectionScript,
 } from '../src/recorder/recorder.mjs';
 
 import {
@@ -552,3 +553,116 @@ test('7. Automation Graph, Intent Matching & Batch Runner', async (t) => {
 
   fs.rmSync(tmpDir, { recursive: true });
 });
+
+test('8. Recording Target Feature, Single Flow Prefix & Input Flush', async (t) => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rec-feature-target-'));
+
+  await t.test('startRecording and stopRecording route to target featureId without creating Recorded Flows', async () => {
+    deleteRecordingSession();
+
+    // Create an initial project with an Authentication feature
+    const initRes = await runTool('automation_graph_get', {}, { cwd: tmpDir });
+    assert.equal(initRes.ok, true);
+    const authFeatRes = await runTool('automation_feature_create', {
+      name: 'Authentication',
+      description: 'Sign-in journey',
+    }, { cwd: tmpDir });
+    assert.equal(authFeatRes.ok, true);
+    const authFeatId = authFeatRes.data.feature.id;
+
+    const mockSession = {
+      port: 9222,
+      page: {
+        url: () => 'https://uiqa.credlixlab.com/login',
+        exposeFunction: async () => {},
+        addInitScript: async () => {},
+        evaluate: async () => [],
+        goto: async () => {},
+      },
+    };
+
+    // Start recording with target feature
+    const startRes = await startRecording(mockSession, {
+      startUrl: 'https://uiqa.credlixlab.com/login',
+      flowName: 'flow-ktm2',
+      featureId: authFeatId,
+      featureName: 'Authentication',
+      cwd: tmpDir,
+    });
+    assert.equal(startRes.ok, true);
+
+    // Stop recording
+    const stopRes = await stopRecording({
+      cwd: tmpDir,
+      session: mockSession,
+      featureId: authFeatId,
+      featureName: 'Authentication',
+    });
+    assert.equal(stopRes.ok, true);
+
+    // Verify project.json structure
+    const proj = JSON.parse(fs.readFileSync(path.join(tmpDir, 'automation', 'project.json'), 'utf8'));
+    // Recorded Flows should NOT exist
+    const recordedFeat = proj.features.find(f => f.name.toLowerCase() === 'recorded flows');
+    assert.equal(recordedFeat, undefined);
+
+    // Authentication feature should contain flow with id 'flow-ktm2', not 'flow-flow-ktm2'
+    const authFeat = proj.features.find(f => f.id === authFeatId);
+    assert.ok(authFeat);
+    assert.equal(authFeat.flows.length, 1);
+    assert.equal(authFeat.flows[0].id, 'flow-ktm2');
+    assert.equal(authFeat.flows[0].name, 'flow-ktm2');
+  });
+
+  await t.test('getRecorderInjectionScript contains flushAllInputs, focusin, focusout, and input debounce', () => {
+    const script = getRecorderInjectionScript('test-flow');
+    assert.ok(script.includes('flushActiveInput'));
+    assert.ok(script.includes('flushAllInputs'));
+    assert.ok(script.includes('flushElementInput'));
+    assert.ok(script.includes('inputDebounceTimer'));
+    assert.ok(script.includes('focusin'));
+    assert.ok(script.includes('focusout'));
+    assert.ok(script.includes('submit'));
+    assert.ok(script.includes('beforeunload'));
+    assert.ok(script.includes('Enter'));
+  });
+
+  await t.test('stopRecording routes to existing feature even if generic Recorded Flows is passed', async () => {
+    deleteRecordingSession();
+
+    // Create an initial project with Authentication feature
+    const mockSession = {
+      port: 9222,
+      page: {
+        url: () => 'https://uiqa.credlixlab.com/login',
+        exposeFunction: async () => {},
+        addInitScript: async () => {},
+        evaluate: async () => [],
+        goto: async () => {},
+      },
+    };
+
+    await startRecording(mockSession, {
+      startUrl: 'https://uiqa.credlixlab.com/login',
+      flowName: 'flow-second-journey',
+      featureName: 'Recorded Flows', // Untargeted / generic
+      cwd: tmpDir,
+    });
+
+    const stopRes = await stopRecording({
+      cwd: tmpDir,
+      session: mockSession,
+      featureName: 'Recorded Flows',
+    });
+    assert.equal(stopRes.ok, true);
+
+    const proj = JSON.parse(fs.readFileSync(path.join(tmpDir, 'automation', 'project.json'), 'utf8'));
+    // Recorded Flows must still not exist; flow added to Authentication
+    const recordedFeat = proj.features.find(f => f.name.toLowerCase() === 'recorded flows');
+    assert.equal(recordedFeat, undefined);
+    assert.equal(proj.features[0].flows.length, 2);
+  });
+
+  fs.rmSync(tmpDir, { recursive: true });
+});
+
