@@ -245,6 +245,7 @@ export function getRecorderInjectionScript(flowName = '') {
     if (window.__opscodeRecordingState && window.__opscodeRecordingState.isPaused) return;
     if (!window.__opscodeRecordingState || !window.__opscodeRecordingState.isRecording) return;
 
+    step.url = step.url || window.location.href;
     window.__opscodeRecordingState.steps.push(step);
     persistState();
 
@@ -448,6 +449,9 @@ export async function startRecording(session, options = {}) {
   }
 
   // Navigate to startUrl if specified
+  if (typeof page?.bringToFront === 'function') {
+    await page.bringToFront().catch(() => {});
+  }
   if (startUrl && page.url() !== startUrl) {
     try {
       await page.goto(startUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
@@ -581,12 +585,22 @@ export async function stopRecording(options = {}) {
   const flowDir = path.resolve(cwd, 'automation', rec.flowName);
   fs.mkdirSync(flowDir, { recursive: true });
 
+  const steps = rec.steps || [];
+  let endUrl = rec.startUrl || '';
+  for (let i = steps.length - 1; i >= 0; i--) {
+    if (steps[i].url && typeof steps[i].url === 'string' && steps[i].url.startsWith('http')) {
+      endUrl = steps[i].url;
+      break;
+    }
+  }
+
   const flowData = {
     name: rec.flowName,
     createdAt: new Date().toISOString(),
     startUrl: rec.startUrl,
-    stepCount: (rec.steps || []).length,
-    steps: rec.steps || [],
+    endUrl,
+    stepCount: steps.length,
+    steps,
   };
 
   const flowFile = path.join(flowDir, 'flow.json');
@@ -634,7 +648,9 @@ export async function stopRecording(options = {}) {
       description: `Automated flow starting at ${rec.startUrl || ''}`,
       flowPath: relFlow,
       specPath: relSpec,
-      stepCount: (rec.steps || []).length,
+      startUrl: rec.startUrl,
+      endUrl,
+      stepCount: steps.length,
       lastRunStatus: 'idle',
       lastRunAt: new Date().toISOString(),
     };

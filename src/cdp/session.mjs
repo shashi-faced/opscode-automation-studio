@@ -43,6 +43,20 @@ export async function isCdpEndpointActive(port, timeoutMs = 1500) {
 }
 
 /**
+ * Check if the active port is running a headless Chrome
+ */
+export async function isPortHeadless(port) {
+  if (!port) return false;
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/json/version`);
+    const data = await res.json();
+    return String(data['User-Agent'] || data.Browser || '').includes('Headless');
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Locate system Chrome / Chromium binary if available
  */
 export function findSystemBrowserExecutable() {
@@ -135,7 +149,14 @@ export async function getBrowserSession(options = {}) {
   const standalonePort = getStandaloneDevToolsPort() || 9222;
   const standaloneActive = !opscodeActive && (await isCdpEndpointActive(standalonePort));
 
-  const activePort = opscodeActive ? opscodePort : (standaloneActive ? standalonePort : null);
+  let activePort = opscodeActive ? opscodePort : (standaloneActive ? standalonePort : null);
+  if (activePort && !headless && (await isPortHeadless(activePort))) {
+    const sysChrome = findSystemBrowserExecutable();
+    if (sysChrome) {
+      console.log(`[CDP] Detected port ${activePort} is headless, but headed session requested. Spawning visible browser.`);
+      activePort = null;
+    }
+  }
 
   if (activePort) {
     try {
@@ -153,6 +174,10 @@ export async function getBrowserSession(options = {}) {
         }
       } else {
         page = await context.newPage();
+      }
+
+      if (typeof page?.bringToFront === 'function') {
+        await page.bringToFront().catch(() => {});
       }
 
       if (url && page.url() !== url && url !== 'about:blank') {
