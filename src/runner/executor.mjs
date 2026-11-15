@@ -26,6 +26,9 @@ export async function runFlow(session, flowInput, options = {}) {
   }
 
   const { page } = session;
+  if (typeof page?.bringToFront === 'function') {
+    await page.bringToFront().catch(() => {});
+  }
   const steps = Array.isArray(flow.steps) ? flow.steps : [];
   const resolver = new SelectorResolver({ defaultTimeout: options.timeout || 5000 });
 
@@ -48,8 +51,11 @@ export async function runFlow(session, flowInput, options = {}) {
       switch (act) {
         case 'goto':
         case 'navigate': {
-          const targetUrl = step.url || step.value;
+          let targetUrl = step.url || step.value;
           if (targetUrl) {
+            if (!/^https?:\/\//i.test(targetUrl) && !targetUrl.startsWith('file://')) {
+              targetUrl = 'https://' + targetUrl;
+            }
             await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
           }
           break;
@@ -122,7 +128,8 @@ export async function runFlow(session, flowInput, options = {}) {
           break;
         }
 
-        case 'assert': {
+        case 'assert':
+        case 'assert_visible': {
           const res = await resolver.resolve(page, step.selectorSet, step.description, step);
           layerUsed = res.layerUsed;
           healed = res.healed;

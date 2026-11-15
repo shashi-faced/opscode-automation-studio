@@ -71,7 +71,10 @@ export function compileStepToCode(step, index, options = {}) {
   switch (act) {
     case 'goto':
     case 'navigate': {
-      const targetUrl = step.url || step.value || '';
+      let targetUrl = step.url || step.value || '';
+      if (targetUrl && !/^https?:\/\//i.test(targetUrl) && !targetUrl.startsWith('file://')) {
+        targetUrl = 'https://' + targetUrl;
+      }
       return `${desc}\n    await page.goto(${JSON.stringify(targetUrl)}, { waitUntil: 'domcontentloaded' });`;
     }
     case 'click': {
@@ -103,7 +106,8 @@ export function compileStepToCode(step, index, options = {}) {
       const shotPath = step.path || `screenshots/step-${index + 1}.png`;
       return `${desc}\n    await page.screenshot({ path: ${JSON.stringify(shotPath)} });`;
     }
-    case 'assert': {
+    case 'assert':
+    case 'assert_visible': {
       return `${desc}\n    await expect(${locatorCode}).toBeVisible();`;
     }
     case 'scroll': {

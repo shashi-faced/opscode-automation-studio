@@ -265,17 +265,22 @@ export async function runTool(name, params = {}, context = {}) {
         return { ok: false, text: 'Missing required parameter "url".' };
       }
 
+      let recordUrl = params.url;
+      if (recordUrl && !/^https?:\/\//i.test(recordUrl) && recordUrl !== 'about:blank' && !recordUrl.startsWith('file://')) {
+        recordUrl = 'https://' + recordUrl;
+      }
+
       if (!activeBrowserSession) {
         activeBrowserSession = await getBrowserSession({
-          url: params.url,
+          url: recordUrl,
           headless: false,
           persistent: true,
         });
       }
 
       const res = await startRecording(activeBrowserSession, {
-        flowName: params.flowName,
-        startUrl: params.url,
+        flowName: params.flowName || params.name,
+        startUrl: recordUrl,
         cwd,
       });
 
@@ -357,10 +362,20 @@ export async function runTool(name, params = {}, context = {}) {
         return { ok: false, text: `Flow file not found: ${params.flow}. Looked under ${cwd} and automation project graph.` };
       }
 
+      let startUrl;
+      try {
+        const flowData = JSON.parse(fs.readFileSync(flowPath, 'utf8'));
+        startUrl = flowData.startUrl || (flowData.steps && flowData.steps[0] && (flowData.steps[0].url || flowData.steps[0].value));
+        if (startUrl && !/^https?:\/\//i.test(startUrl) && startUrl !== 'about:blank' && !startUrl.startsWith('file://')) {
+          startUrl = 'https://' + startUrl;
+        }
+      } catch {}
+
       let session;
       try {
         session = await getBrowserSession({
           headless: params.headless ?? false,
+          url: startUrl,
         });
       } catch (err) {
         return { ok: false, text: `Failed to connect to browser session: ${err.message}` };

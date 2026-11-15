@@ -378,11 +378,16 @@ export async function startRecording(session, options = {}) {
   const { flowName = `flow-${Date.now()}`, startUrl, cwd = process.cwd() } = options;
   const { page } = session;
 
+  let normStartUrl = startUrl;
+  if (normStartUrl && !/^https?:\/\//i.test(normStartUrl) && normStartUrl !== 'about:blank' && !normStartUrl.startsWith('file://')) {
+    normStartUrl = 'https://' + normStartUrl;
+  }
+
   activeRecording = {
     isRecording: true,
     isPaused: false,
     flowName,
-    startUrl: startUrl || page.url(),
+    startUrl: normStartUrl || page.url(),
     startTime: Date.now(),
     cwd,
     port: session.port,
@@ -436,6 +441,11 @@ export async function startRecording(session, options = {}) {
   try {
     await page.addInitScript(fullScript);
   } catch {}
+  if (session?.context?.addInitScript) {
+    try {
+      await session.context.addInitScript(fullScript);
+    } catch {}
+  }
 
   // Also inject immediately into the current DOM
   try {
@@ -452,13 +462,13 @@ export async function startRecording(session, options = {}) {
   if (typeof page?.bringToFront === 'function') {
     await page.bringToFront().catch(() => {});
   }
-  if (startUrl && page.url() !== startUrl) {
+  if (normStartUrl && page.url() !== normStartUrl) {
     try {
-      await page.goto(startUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.goto(normStartUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
       activeRecording.steps.push({
         action: 'goto',
-        url: startUrl,
-        description: `Navigate to ${startUrl}`,
+        url: normStartUrl,
+        description: `Navigate to ${normStartUrl}`,
         timestamp: Date.now(),
       });
     } catch (err) {
@@ -512,23 +522,26 @@ export async function getRecordingStatus(options = {}) {
   // Try to query active page in browser to sync any fresh in-page recorded steps
   try {
     const session = options.session || activeRecording?.session || await getBrowserSession({ persistent: false });
-    if (session?.page) {
-      const inPage = await session.page.evaluate(() => {
-        return window.__opscodeRecordingState
-          ? { steps: window.__opscodeRecordingState.steps, isPaused: window.__opscodeRecordingState.isPaused }
-          : null;
-      });
-      if (inPage && Array.isArray(inPage.steps)) {
-        const existingTs = new Set((rec.steps || []).map(s => s.timestamp));
-        for (const s of inPage.steps) {
-          if (s && s.timestamp && !existingTs.has(s.timestamp)) {
-            rec.steps.push(s);
-            existingTs.add(s.timestamp);
+    const pages = (session?.context?.pages && session.context.pages()) || (session?.page ? [session.page] : []);
+    for (const page of pages) {
+      try {
+        const inPage = await page.evaluate(() => {
+          return window.__opscodeRecordingState
+            ? { steps: window.__opscodeRecordingState.steps, isPaused: window.__opscodeRecordingState.isPaused }
+            : null;
+        });
+        if (inPage && Array.isArray(inPage.steps)) {
+          const existingTs = new Set((rec.steps || []).map(s => s.timestamp));
+          for (const s of inPage.steps) {
+            if (s && s.timestamp && !existingTs.has(s.timestamp)) {
+              rec.steps.push(s);
+              existingTs.add(s.timestamp);
+            }
           }
+          if (typeof inPage.isPaused === 'boolean') rec.isPaused = inPage.isPaused;
+          writeRecordingSession(rec);
         }
-        if (typeof inPage.isPaused === 'boolean') rec.isPaused = inPage.isPaused;
-        writeRecordingSession(rec);
-      }
+      } catch {}
     }
   } catch {}
 
@@ -555,26 +568,32 @@ export async function stopRecording(options = {}) {
     };
   }
 
-  // Attempt to sync final in-page steps and remove sidebar widget
+  // Attempt to sync final in-page steps and remove sidebar widget across all open pages
   try {
     const session = options.session || activeRecording?.session || await getBrowserSession({ persistent: false });
-    if (session?.page) {
-      const inPageSteps = await session.page.evaluate(() => {
-        const state = window.__opscodeRecordingState;
-        const root = document.getElementById('opscode-recording-sidebar-root');
-        if (root) root.remove();
-        try { sessionStorage.removeItem('__opscode_recording_state'); } catch {}
-        return state ? state.steps : [];
-      });
-      if (Array.isArray(inPageSteps)) {
-        const existingTs = new Set((rec.steps || []).map(s => s.timestamp));
-        for (const s of inPageSteps) {
-          if (s && s.timestamp && !existingTs.has(s.timestamp)) {
-            rec.steps.push(s);
-            existingTs.add(s.timestamp);
+    const pages = (session?.context?.pages && session.context.pages()) || (session?.page ? [session.page] : []);
+    for (const page of pages) {
+      try {
+        const inPageSteps = await page.evaluate(() => {
+          const state = window.__opscodeRecordingState;
+          const root = document.getElementById('opscode-recording-sidebar-root');
+          if (root) root.remove();
+          try { sessionStorage.removeItem('__opscode_recording_state'); } catch {}
+          return state ? state.steps : [];
+        });
+        if (Array.isArray(inPageSteps)) {
+          const existingTs = new Set((rec.steps || []).map(s => s.timestamp));
+          for (const s of inPageSteps) {
+            if (s && s.timestamp && !existingTs.has(s.timestamp)) {
+              rec.steps.push(s);
+              existingTs.add(s.timestamp);
+            }
           }
         }
-      }
+      } catch {}
+    }
+    if (Array.isArray(rec.steps)) {
+      rec.steps.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
     }
   } catch {}
 

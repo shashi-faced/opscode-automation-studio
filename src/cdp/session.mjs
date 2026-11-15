@@ -164,13 +164,21 @@ export async function getBrowserSession(options = {}) {
       const contexts = browser.contexts();
       const context = contexts.length > 0 ? contexts[0] : await browser.newContext();
       let page;
-      const pages = context.pages();
+      const pages = context.pages().filter(p => {
+        try {
+          const u = p.url();
+          return !p.isClosed() && !u.startsWith('chrome://') && !u.startsWith('devtools://');
+        } catch {
+          return false;
+        }
+      });
       if (!forceNewPage && pages.length > 0) {
         if (url) {
           const match = pages.find(p => p.url() === url || (url.startsWith('http') && p.url().startsWith(url)));
           page = match || pages[pages.length - 1];
         } else {
-          page = pages[pages.length - 1];
+          const nonBlank = pages.filter(p => p.url() && p.url() !== 'about:blank');
+          page = nonBlank.length > 0 ? nonBlank[nonBlank.length - 1] : pages[pages.length - 1];
         }
       } else {
         page = await context.newPage();
@@ -182,7 +190,8 @@ export async function getBrowserSession(options = {}) {
 
       if (url && page.url() !== url && url !== 'about:blank') {
         try {
-          await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+          const navUrl = /^https?:\/\//i.test(url) || url.startsWith('file://') ? url : `https://${url}`;
+          await page.goto(navUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
         } catch (e) {
           console.warn(`[CDP] Initial navigation warning: ${e.message}`);
         }
@@ -211,12 +220,24 @@ export async function getBrowserSession(options = {}) {
         const contexts = browser.contexts();
         const context = contexts.length > 0 ? contexts[0] : await browser.newContext();
         let page;
-        const pages = context.pages();
+        const pages = context.pages().filter(p => {
+          try {
+            const u = p.url();
+            return !p.isClosed() && !u.startsWith('chrome://') && !u.startsWith('devtools://');
+          } catch {
+            return false;
+          }
+        });
         page = pages.length > 0 ? pages[pages.length - 1] : await context.newPage();
+
+        if (typeof page?.bringToFront === 'function') {
+          await page.bringToFront().catch(() => {});
+        }
 
         if (url && url !== 'about:blank') {
           try {
-            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+            const navUrl = /^https?:\/\//i.test(url) || url.startsWith('file://') ? url : `https://${url}`;
+            await page.goto(navUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
           } catch (e) {
             console.warn(`[Standalone-CDP] Initial navigation warning: ${e.message}`);
           }

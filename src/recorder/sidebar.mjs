@@ -283,6 +283,9 @@ export function getSidebarInjectionScript() {
     if (window.opscodeSidebarAction) {
       try { window.opscodeSidebarAction({ type: 'stop' }); } catch {}
     }
+    setTimeout(() => {
+      btnStop.textContent = '✓ Finished';
+    }, 400);
   });
 
   // Expose UI updater for recorder

@@ -160,6 +160,9 @@ test('3. Playwright Spec Compiler', async (t) => {
     const gotoCode = compileStepToCode({ action: 'goto', url: 'https://example.com' }, 0);
     assert.match(gotoCode, /await page\.goto\("https:\/\/example\.com"/);
 
+    const gotoNoSchemeCode = compileStepToCode({ action: 'goto', url: 'example.com' }, 0);
+    assert.match(gotoNoSchemeCode, /await page\.goto\("https:\/\/example\.com"/);
+
     const clickCode = compileStepToCode({ action: 'click', selectorSet: { primarySelector: '[data-testid="btn"]' }, description: 'Click button' }, 1);
     assert.match(clickCode, /await page\.getByTestId\("btn"\)\.click\(\)/);
 
@@ -168,6 +171,9 @@ test('3. Playwright Spec Compiler', async (t) => {
 
     const assertCode = compileStepToCode({ action: 'assert', selectorSet: { textSelector: 'Welcome' } }, 3);
     assert.match(assertCode, /await expect\(page\.getByText\("Welcome"\)\)\.toBeVisible\(\)/);
+
+    const assertVisibleCode = compileStepToCode({ action: 'assert_visible', selectorSet: { textSelector: 'Dashboard' } }, 3);
+    assert.match(assertVisibleCode, /await expect\(page\.getByText\("Dashboard"\)\)\.toBeVisible\(\)/);
 
     const selectCode = compileStepToCode({ action: 'select', selectorSet: { cssSelector: 'select#role' }, value: 'admin' }, 4);
     assert.match(selectCode, /await page\.locator\("select#role"\)\.selectOption\("admin"\)/);
@@ -366,6 +372,56 @@ test('6. Tool Definitions & CLI Tool Runner', async (t) => {
 
     const idleStatus = await getRecordingStatus();
     assert.equal(idleStatus.isRecording, false);
+
+    fs.rmSync(tmpDir, { recursive: true });
+  });
+
+  await t.test('stopRecording scans all open pages in browser context for in-page steps', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rec-multipage-'));
+    deleteRecordingSession();
+
+    const now = Date.now();
+    const page1 = {
+      url: () => 'https://example.com',
+      exposeFunction: async () => {},
+      addInitScript: async () => {},
+      goto: async () => {},
+      evaluate: async (fn) => {
+        if (typeof fn === 'function') {
+          return [
+            { action: 'click', selectorSet: { primarySelector: '#tab1-btn' }, timestamp: now + 50, description: 'Click button in tab 1' },
+          ];
+        }
+      },
+    };
+    const page2 = {
+      url: () => 'https://example.com/other',
+      evaluate: async () => [
+        { action: 'click', selectorSet: { primarySelector: '#btn' }, timestamp: now + 100, description: 'Click button in tab 2' },
+      ],
+    };
+
+    const multiPageSession = {
+      port: 9222,
+      page: page1,
+      context: {
+        pages: () => [page1, page2],
+      },
+    };
+
+    await startRecording(multiPageSession, {
+      flowName: 'multipage-flow',
+      startUrl: 'https://example.com',
+      cwd: tmpDir,
+    });
+
+    const stopRes = await stopRecording({ cwd: tmpDir, session: multiPageSession });
+    assert.equal(stopRes.ok, true);
+
+    const flowData = JSON.parse(fs.readFileSync(stopRes.flowFile, 'utf8'));
+    assert.equal(flowData.steps.length, 3);
+    assert.equal(flowData.steps[1].description, 'Click button in tab 1');
+    assert.equal(flowData.steps[2].description, 'Click button in tab 2');
 
     fs.rmSync(tmpDir, { recursive: true });
   });
