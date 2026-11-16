@@ -300,13 +300,14 @@ test('5. Automation Studio Doctor', async () => {
 });
 
 test('6. Tool Definitions & CLI Tool Runner', async (t) => {
-  await t.test('TOOL_DEFS defines all 14 tools with valid parameters', () => {
+  await t.test('TOOL_DEFS defines all 15 tools with valid parameters', () => {
     const expected = [
       'automation_record_start',
       'automation_record_stop',
       'automation_record_status',
       'automation_flow_run',
       'automation_flow_compile',
+      'automation_flow_accept_fix',
       'automation_visual_diff',
       'automation_audit',
       'automation_doctor',

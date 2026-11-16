@@ -4,6 +4,7 @@ import { getBrowserSession, closeSession } from './cdp/session.mjs';
 import { startRecording, stopRecording, getRecordingStatus } from './recorder/recorder.mjs';
 import { runFlow } from './runner/executor.mjs';
 import { compileFlowFile } from './runner/compiler.mjs';
+import { commitHealedFlow } from './runner/autoUpdater.mjs';
 import { compareImages } from './runner/visual.mjs';
 import { auditPage } from './runner/audit.mjs';
 import { runDoctor } from './doctor.mjs';
@@ -192,6 +193,21 @@ export const TOOL_DEFS = [
       required: [],
     },
   },
+  {
+    name: 'automation_flow_accept_fix',
+    description: 'Permanently apply an AI-healed or fallback selector to a step in flow.json and recompile the Playwright test spec (.spec.ts).',
+    parameters: {
+      type: 'object',
+      properties: {
+        flow: { type: 'string', description: 'Path to flow.json, flow ID or flow name' },
+        stepIndex: { type: 'number', description: 'Step index to update (1-based)' },
+        healedSelector: { type: 'string', description: 'The verified healed selector string' },
+        strategy: { type: 'string', description: 'Healing strategy applied (e.g. AI_REASONING, DOM_SCAN)' },
+        explanation: { type: 'string', description: 'Optional explanation of why the fix was applied' },
+      },
+      required: ['flow', 'stepIndex', 'healedSelector'],
+    },
+  },
 ];
 
 function resolveFlowPath(cwd, input) {
@@ -367,6 +383,7 @@ export async function runTool(name, params = {}, context = {}) {
         const res = await runFlow(session, flowPath, {
           cwd,
           continueOnError: !!params.continueOnError,
+          autoCommitHealing: !!params.autoCommitHealing,
           onProgress: context.onProgress,
         });
 
@@ -380,6 +397,10 @@ export async function runTool(name, params = {}, context = {}) {
                 fl.lastRunStatus = res.ok ? 'pass' : 'fail';
                 fl.lastRunDurationMs = res.durationMs;
                 fl.lastRunAt = new Date().toISOString();
+                fl.lastRunId = res.runId;
+                if (res.runDir) {
+                  fl.lastRunSummaryPath = path.relative(cwd, path.join(res.runDir, 'run-summary.json'));
+                }
               }
             }
           }
@@ -414,6 +435,27 @@ export async function runTool(name, params = {}, context = {}) {
       return {
         ok: true,
         text: `Compiled ${res.stepCount} steps into Playwright spec: ${path.relative(cwd, res.specFile)}`,
+        data: res,
+      };
+    }
+
+    case 'automation_flow_accept_fix': {
+      if (!params.flow || !params.stepIndex || !params.healedSelector) {
+        return { ok: false, text: 'Missing required parameters: flow, stepIndex, and healedSelector.' };
+      }
+      const flowPath = resolveFlowPath(cwd, params.flow);
+      if (!flowPath) {
+        return { ok: false, text: `Flow file not found: ${params.flow}` };
+      }
+      const res = commitHealedFlow(flowPath, Number(params.stepIndex), {
+        healedSelector: params.healedSelector,
+        strategy: params.strategy || 'AI_REASONING',
+        confidence: params.confidence || 0.95,
+        explanation: params.explanation,
+      });
+      return {
+        ok: true,
+        text: `Applied AI fix to step ${params.stepIndex} and recompiled spec: ${path.relative(cwd, res.specFile || res.flowFilePath)}`,
         data: res,
       };
     }

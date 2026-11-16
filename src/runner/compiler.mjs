@@ -38,19 +38,21 @@ export function buildPlaywrightLocatorCode(step, options = {}) {
     candidates.push(`page.locator(${JSON.stringify(step.selector)})`);
   }
 
-  if (!candidates.length) {
+  const uniqueCandidates = [...new Set(candidates)];
+
+  if (!uniqueCandidates.length) {
     return `page.locator('body')`;
   }
 
-  if (options.withFallbacks && candidates.length > 1) {
-    let expr = candidates[0];
-    for (let i = 1; i < candidates.length; i++) {
-      expr += `.or(${candidates[i]})`;
+  if (options.withFallbacks && uniqueCandidates.length > 1) {
+    let expr = uniqueCandidates[0];
+    for (let i = 1; i < uniqueCandidates.length; i++) {
+      expr += `.or(${uniqueCandidates[i]})`;
     }
     return expr;
   }
 
-  return candidates[0];
+  return uniqueCandidates[0];
 }
 
 /**

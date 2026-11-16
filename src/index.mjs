@@ -8,3 +8,6 @@ export * from './runner/compiler.mjs';
 export * from './runner/visual.mjs';
 export * from './runner/audit.mjs';
 export * from './doctor.mjs';
+export * from './telemetry/flightRecorder.mjs';
+export * from './ai/reasoningEngine.mjs';
+export * from './runner/autoUpdater.mjs';

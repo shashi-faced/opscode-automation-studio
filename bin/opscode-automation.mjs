@@ -94,7 +94,23 @@ async function main() {
       }
 
       case 'run': {
-        const r = await runTool('automation_flow_run', { flow: pos[0], continueOnError: !!flags.continue, headless: !!flags.headless }, { cwd: flags.cwd || process.cwd(), onProgress: progress });
+        const r = await runTool('automation_flow_run', {
+          flow: pos[0],
+          continueOnError: !!flags.continue,
+          headless: !!flags.headless,
+          autoCommitHealing: !!flags['auto-commit'] || !!flags.autoCommit,
+        }, { cwd: flags.cwd || process.cwd(), onProgress: progress });
+        return done(r, r.ok ? 0 : 1);
+      }
+
+      case 'accept-fix': {
+        const r = await runTool('automation_flow_accept_fix', {
+          flow: pos[0],
+          stepIndex: flags.step || flags.stepIndex,
+          healedSelector: flags.selector || flags.healedSelector,
+          strategy: flags.strategy,
+          explanation: flags.explanation,
+        }, { cwd: flags.cwd || process.cwd() });
         return done(r, r.ok ? 0 : 1);
       }
 
