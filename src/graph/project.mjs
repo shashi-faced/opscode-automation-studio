@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { compileFlowToSpec } from '../runner/compiler.mjs';
+import { ensureFlowGraph } from '../flow/graph.mjs';
 import { runFlow } from '../runner/executor.mjs';
 import { getBrowserSession, closeSession } from '../cdp/session.mjs';
 
@@ -317,16 +318,20 @@ export function createFlow(cwd, { featureId, name, description = '', steps = [],
     throw new Error('Flow name is required');
   }
 
-  const project = loadProject(cwd);
-  let feature = project.features.find(f => f.id === featureId || f.name.toLowerCase() === String(featureId || '').toLowerCase());
+  let project = loadProject(cwd);
+  const want = String(featureId || '').trim();
+  let feature = project.features.find(f => f.id === want || f.name.toLowerCase() === want.toLowerCase());
 
   if (!feature) {
-    if (project.features.length > 0) {
-      feature = project.features[0];
-    } else {
-      const res = createFeature(cwd, { name: 'General', description: 'Core application flows' });
-      feature = res.feature;
+    if (want && !/^feat-/.test(want)) {
+      // A feature name that does not exist yet: create it (e.g. "Orders").
+      createFeature(cwd, { name: want, description: '' });
+    } else if (project.features.length === 0) {
+      createFeature(cwd, { name: 'General', description: 'Core application flows' });
     }
+    // Reload: createFeature saved its own copy of the project.
+    project = loadProject(cwd);
+    feature = project.features.find(f => f.name.toLowerCase() === want.toLowerCase()) || project.features[0];
   }
 
   const featureSlug = slugify(feature.name);
@@ -354,6 +359,8 @@ export function createFlow(cwd, { featureId, name, description = '', steps = [],
     stepCount: initialSteps.length,
     steps: initialSteps,
   };
+
+  ensureFlowGraph(flowData); // node ids, labels and edges (flow format v2)
 
   const flowFilePath = path.join(flowDir, 'flow.json');
   fs.writeFileSync(flowFilePath, JSON.stringify(flowData, null, 2), 'utf8');
@@ -658,6 +665,7 @@ export async function batchRunFlows(cwd, options = {}) {
           res = await runFlow(session, fullFlowPath, {
             cwd,
             continueOnError,
+            dataMode: options.dataMode,
             onProgress: (p) => {
               if (onProgress) onProgress({ ...p, flowId: flow.id, flowName: flow.name });
             },

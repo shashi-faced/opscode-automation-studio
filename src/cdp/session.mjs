@@ -101,6 +101,8 @@ async function launchPersistentChrome(executablePath, port = 9222, headless = fa
     '--no-first-run',
     '--no-default-browser-check',
     '--disable-dev-shm-usage',
+    // Same as the Opscode browser: no back/forward cache, so a tab is always the live document.
+    '--disable-features=BackForwardCache',
     `--user-data-dir=${STANDALONE_PROFILE_DIR}`,
     '--window-size=1280,800',
     'about:blank',
@@ -141,8 +143,11 @@ export async function getBrowserSession(options = {}) {
     persistent = true,
   } = options;
 
-  // 1. Try Opscode internal browser
-  const opscodePort = options.port || getOpscodeDevToolsPort();
+  // 1. Try Opscode internal browser. It is used even when it runs headless: the app shows it in
+  //    the Browser tab and forwards the user's clicks and typing to it, and it has the user's logins.
+  //    OPSCODE_AUTOMATION_CDP_PORT (or options.port) points at a specific browser instead.
+  const envPort = parseInt(process.env.OPSCODE_AUTOMATION_CDP_PORT || '', 10);
+  const opscodePort = options.port || (Number.isFinite(envPort) && envPort > 0 ? envPort : null) || getOpscodeDevToolsPort();
   const opscodeActive = opscodePort ? await isCdpEndpointActive(opscodePort) : false;
 
   // 2. Try existing standalone CDP port
@@ -150,10 +155,11 @@ export async function getBrowserSession(options = {}) {
   const standaloneActive = !opscodeActive && (await isCdpEndpointActive(standalonePort));
 
   let activePort = opscodeActive ? opscodePort : (standaloneActive ? standalonePort : null);
-  if (activePort && !headless && (await isPortHeadless(activePort))) {
+  // Only our own standalone Chrome is replaced when it is headless and a visible one was asked for.
+  if (activePort && !opscodeActive && !headless && options.requireHeaded && (await isPortHeadless(activePort))) {
     const sysChrome = findSystemBrowserExecutable();
     if (sysChrome) {
-      console.log(`[CDP] Detected port ${activePort} is headless, but headed session requested. Spawning visible browser.`);
+      process.stderr.write(`[CDP] Port ${activePort} is headless but a visible browser was requested. Opening one.\n`);
       activePort = null;
     }
   }
@@ -193,7 +199,7 @@ export async function getBrowserSession(options = {}) {
           const navUrl = /^https?:\/\//i.test(url) || url.startsWith('file://') ? url : `https://${url}`;
           await page.goto(navUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
         } catch (e) {
-          console.warn(`[CDP] Initial navigation warning: ${e.message}`);
+          process.stderr.write(`[CDP] Initial navigation warning: ${e.message}` + "\n");
         }
       }
 
@@ -206,7 +212,7 @@ export async function getBrowserSession(options = {}) {
         isCdp: true,
       };
     } catch (err) {
-      console.warn(`[CDP] Failed to connect to CDP port ${activePort}: ${err.message}. Falling back.`);
+      process.stderr.write(`[CDP] Failed to connect to CDP port ${activePort}: ${err.message}. Falling back.` + "\n");
     }
   }
 
@@ -239,7 +245,7 @@ export async function getBrowserSession(options = {}) {
             const navUrl = /^https?:\/\//i.test(url) || url.startsWith('file://') ? url : `https://${url}`;
             await page.goto(navUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
           } catch (e) {
-            console.warn(`[Standalone-CDP] Initial navigation warning: ${e.message}`);
+            process.stderr.write(`[Standalone-CDP] Initial navigation warning: ${e.message}` + "\n");
           }
         }
 
@@ -253,7 +259,7 @@ export async function getBrowserSession(options = {}) {
         };
       }
     } catch (err) {
-      console.warn(`[Standalone-CDP] Detached launch notice: ${err.message}. Using standard launch.`);
+      process.stderr.write(`[Standalone-CDP] Detached launch notice: ${err.message}. Using standard launch.` + "\n");
     }
   }
 
@@ -276,7 +282,7 @@ export async function getBrowserSession(options = {}) {
     try {
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
     } catch (e) {
-      console.warn(`[Standalone] Navigation warning: ${e.message}`);
+      process.stderr.write(`[Standalone] Navigation warning: ${e.message}` + "\n");
     }
   }
 

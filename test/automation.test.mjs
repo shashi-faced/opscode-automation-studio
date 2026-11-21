@@ -5,6 +5,9 @@ import path from 'node:path';
 import os from 'node:os';
 import { PNG } from 'pngjs';
 
+// Recorder session files go to a temp folder, never to the real ~/.opscode/run
+process.env.OPSCODE_AUTOMATION_RUN_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'oas-run-'));
+
 import {
   getOpscodeDevToolsPort,
   isCdpEndpointActive,
@@ -300,7 +303,7 @@ test('5. Automation Studio Doctor', async () => {
 });
 
 test('6. Tool Definitions & CLI Tool Runner', async (t) => {
-  await t.test('TOOL_DEFS defines all 15 tools with valid parameters', () => {
+  await t.test('TOOL_DEFS defines all 21 tools with valid parameters', () => {
     const expected = [
       'automation_record_start',
       'automation_record_stop',
@@ -317,6 +320,12 @@ test('6. Tool Definitions & CLI Tool Runner', async (t) => {
       'automation_flow_create',
       'automation_flow_match',
       'automation_batch_run',
+      'automation_step',
+      'automation_flow_get',
+      'automation_module_plan',
+      'automation_flow_data',
+      'automation_issues',
+      'automation_issue_update',
     ];
     const names = TOOL_DEFS.map(t => t.name);
     assert.deepEqual(names.sort(), expected.sort());

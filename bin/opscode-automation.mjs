@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runTool, TOOL_DEFS } from '../src/tools.mjs';
+import { runRecorderDaemon } from '../src/recorder/recorder.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const argv = process.argv.slice(2);
@@ -42,7 +43,8 @@ Commands:
   audit [url]                  WCAG 2.1 accessibility compliance check
   graph                        Retrieve project automation graph hierarchy
   match '<intent>'             Fuzzy match user prompt to saved test flows
-  batch [--feature=<id>]       Batch run all flows or flows in feature`;
+  batch [--feature=<id>]       Batch run all flows or flows in feature
+  recorder-daemon              (internal) background recorder started by automation_record_start`;
 
 async function main() {
   try {
@@ -69,6 +71,12 @@ async function main() {
         const r = await runTool('automation_doctor', {}, { onProgress: progress });
         if (!quiet) process.stderr.write(r.text + '\n');
         return done(r, r.ok ? 0 : 1);
+      }
+
+      case 'recorder-daemon': {
+        // Started by automation_record_start; keeps running until the recording is stopped.
+        await runRecorderDaemon();
+        return;
       }
 
       case 'tools': {

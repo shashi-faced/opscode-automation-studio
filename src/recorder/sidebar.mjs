@@ -5,6 +5,8 @@
 export function getSidebarInjectionScript() {
   return `
 (function() {
+  // Runs at document start for every new page, before <body> exists: mount once the DOM is ready.
+  function __opscodeMountSidebar() {
   if (document.getElementById('opscode-recording-sidebar-root')) return;
 
   const host = document.createElement('div');
@@ -201,7 +203,11 @@ export function getSidebarInjectionScript() {
   shadow.appendChild(style);
 
   const container = document.createElement('div');
-  container.className = 'widget-container';
+  // Starts as a small bar so it does not cover the page (the Browser tab view is small);
+  // expand it to see the recorded steps.
+  let startMinimized = true;
+  try { startMinimized = sessionStorage.getItem('__opscode_widget_expanded') !== '1'; } catch {}
+  container.className = 'widget-container' + (startMinimized ? ' minimized' : '');
   container.innerHTML = \`
     <div class="widget-header">
       <div class="widget-title">
@@ -211,7 +217,8 @@ export function getSidebarInjectionScript() {
       </div>
       <div class="btn-group">
         <button class="icon-btn" id="opscode-btn-pause" title="Pause / Resume">⏸</button>
-        <button class="icon-btn" id="opscode-btn-min" title="Minimize / Expand">_</button>
+        <button class="icon-btn" id="opscode-btn-min" title="Minimize / Expand">\${startMinimized ? '□' : '_'}</button>
+        <button class="icon-btn" id="opscode-btn-stop-mini" title="Stop & Save recording">⏹</button>
       </div>
     </div>
     <div class="widget-body" id="opscode-step-list">
@@ -234,7 +241,9 @@ export function getSidebarInjectionScript() {
   const btnStop = shadow.getElementById('opscode-btn-stop');
 
   let isPaused = false;
-  let isMinimized = false;
+  let isMinimized = startMinimized;
+  const btnStopMini = shadow.getElementById('opscode-btn-stop-mini');
+  btnStopMini.addEventListener('click', (e) => { e.stopPropagation(); btnStop.click(); });
 
   btnPause.addEventListener('click', (e) => {
     e.stopPropagation();
@@ -254,6 +263,7 @@ export function getSidebarInjectionScript() {
     e.stopPropagation();
     isMinimized = !isMinimized;
     container.classList.toggle('minimized', isMinimized);
+    try { sessionStorage.setItem('__opscode_widget_expanded', isMinimized ? '0' : '1'); } catch {}
     btnMin.textContent = isMinimized ? '□' : '_';
   });
 
@@ -324,6 +334,10 @@ export function getSidebarInjectionScript() {
     }).join('');
     stepList.scrollTop = stepList.scrollHeight;
   };
+  if (window.__opscodeRecordingState) window.__opscodeUpdateSidebar(window.__opscodeRecordingState.steps || [], window.__opscodeRecordingState.isPaused);
+  }
+  if (document.body) __opscodeMountSidebar();
+  else document.addEventListener('DOMContentLoaded', __opscodeMountSidebar, { once: true });
 })();
 `;
 }
