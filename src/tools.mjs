@@ -6,6 +6,7 @@ import { performStep, STEP_ACTIONS } from './recorder/stepTool.mjs';
 import { applyDataRules, normalizeRule, describeRule, DATA_KINDS, DATA_MODES } from './data/generate.mjs';
 import { planRunData, readHistory } from './data/runData.mjs';
 import { listIssues, updateIssue, issueLine, ISSUE_STATUSES } from './issues/tracker.mjs';
+import { MORE_TOOL_DEFS, MORE_TOOL_NAMES, runMoreTool, runDataset } from './moreTools.mjs';
 import { ensureFlowGraph, summarizeFlowGraph, getNode } from './flow/graph.mjs';
 import { runFlow } from './runner/executor.mjs';
 import { compileFlowFile, compileFlowToSpec } from './runner/compiler.mjs';
@@ -61,7 +62,7 @@ export const TOOL_DEFS = [
   },
   {
     name: 'automation_step',
-    description: 'Do one action in the browser yourself. While a recording is running, the action is recorded as a node of the flow with your description. Use it to automate a feature step by step. Actions: goto (url), click / check / uncheck / assert_visible (target), fill (target, value), select (target, value), press (target, key), assert_text (value), assert_url (value), wait (ms), decision (condition): a branch point; the following steps go on its yes or no branch depending on the condition now.',
+    description: 'Do one action in the browser yourself. While a recording is running, the action is recorded as a node of the flow with your description. Use it to automate a feature step by step. Actions: goto (url), click / check / uncheck / assert_visible (target), fill (target, value), select (target, value), press (target, key), assert_text (value), assert_url (value), wait (ms), decision (condition): a branch point; the following steps go on its yes or no branch depending on the condition now. Also: hover (target), upload (target = the file input, files), drag (target, to), extract (name, target and/or pattern): read a value shown on the page into a variable usable as {{var:name}} in later steps and flows. Any action can work inside an iframe (frame) and answer a browser dialog it opens (dialog). Values may contain {{var:name}}.',
     parameters: {
       type: 'object',
       properties: {
@@ -76,6 +77,13 @@ export const TOOL_DEFS = [
         label: { type: 'string', description: 'Short node title (optional)' },
         sensitive: { type: 'boolean', description: 'fill only: the value is a password or secret; it is stored outside flow.json' },
         data: { description: 'fill/select only: test data rule for replays. "fixed" (always this value), a kind ("email", "fullName", "phone", "company", "number", "date", ...: a new realistic value every run), a pattern ("ORD-{n:5}", "{firstName} QA {tag}"), or an object { mode: "generate"|"fixed"|"list"|"any", kind, pattern, values, min, max }. Omit it and a rule is suggested when the flow is saved.' },
+        exportAs: { type: 'string', description: 'fill/select only: publish the value typed in each run as a variable (e.g. "customer.email") that later steps and other flows use as {{var:customer.email}}' },
+        to: { description: 'drag only: the drop target (same forms as target)' },
+        files: { description: 'upload only: file name(s) in automation/files/ or paths; a missing file is created as a small placeholder' },
+        name: { type: 'string', description: 'extract only: variable name to set' },
+        pattern: { type: 'string', description: 'extract only: regular expression; its first group (or the whole match) is the value, e.g. "Order #(\\d+)"' },
+        frame: { description: 'The iframe the element is in: a CSS selector of the iframe ("#payment"), its name, or part of its URL' },
+        dialog: { description: 'A browser dialog (alert/confirm/prompt) this action opens: "accept" (default when given), "dismiss", or { accept, text } for a prompt' },
         timeoutMs: { type: 'number', description: 'How long to wait for the element (default 10000)' },
       },
       required: ['action'],
@@ -130,6 +138,7 @@ export const TOOL_DEFS = [
         data: { type: 'string', enum: ['fresh', 'recorded'], description: 'Form data: "fresh" (default) makes new values from each field\'s data rule so repeated runs do not clash; "recorded" types the recorded values' },
         times: { type: 'number', description: 'Run the flow this many times in a row, each with different data (1-20, default 1)' },
         replayRun: { type: 'string', description: 'Run id of an earlier run: replay with exactly the data that run used (to reproduce a failure or verify a fix)' },
+        dataset: { type: 'string', description: 'A CSV file in the workspace: run once per row. Column names are field names or node ids (a column "expect" = pass/fail, "var:<name>" columns set variables); other fields get fresh data' },
       },
       required: ['flow'],
     },
@@ -143,6 +152,7 @@ export const TOOL_DEFS = [
         flow: { type: 'string', description: 'Flow ID, name or path to flow.json' },
         rules: { type: 'object', description: 'Changes: { <node id or field name>: rule }. A rule is "fixed", "any", a kind ("email", "phone", ...), a pattern ("INV-{n:6}", "{company} {tag}"), or { mode, kind, pattern, values, min, max, range: "future"|"past"|"birth" }' },
         reset: { type: 'boolean', description: 'Throw away all rules and suggest them again' },
+        exports: { type: 'object', description: 'Publish field values as variables: { <node id or field name>: "customer.email" } (empty string removes). Another flow then uses rule "var:customer.email" or {{var:customer.email}}' },
         samples: { type: 'number', description: 'How many sample runs to preview (default 2, max 5)' },
       },
       required: ['flow'],
@@ -313,6 +323,7 @@ export const TOOL_DEFS = [
       required: ['flow', 'stepIndex', 'healedSelector'],
     },
   },
+  ...MORE_TOOL_DEFS,
 ];
 
 function resolveFlowPath(cwd, input) {
@@ -381,8 +392,20 @@ function resolveFlowPath(cwd, input) {
   return null;
 }
 
+// Every tool takes an optional `workspace`: the project folder to work in, when the chat runs
+// somewhere else (e.g. a scheduled routine runs in its own folder).
+for (const t of TOOL_DEFS) {
+  if (t.parameters?.properties && !t.parameters.properties.workspace) {
+    t.parameters.properties.workspace = { type: 'string', description: 'Project folder that holds automation/ (only when it is not the current workspace, e.g. in a scheduled routine)' };
+  }
+}
+
 export async function runTool(name, params = {}, context = {}) {
-  const cwd = context.cwd || process.cwd();
+  const cwd = params.workspace ? path.resolve(String(params.workspace).replace(/^~(?=\/|$)/, process.env.HOME || '~')) : context.cwd || process.cwd();
+  if (params.workspace) context = { ...context, cwd };
+  if (MORE_TOOL_NAMES.has(name)) {
+    return runMoreTool(name, params, cwd, { resolveFlowPath, runTool: (n, p) => runTool(n, p, context) });
+  }
 
   switch (name) {
     case 'automation_record_start': {
@@ -551,6 +574,7 @@ export async function runTool(name, params = {}, context = {}) {
       if (recNow.isRecording && recNow.alive) {
         return { ok: false, text: `A recording ("${recNow.flowName}") is running; replaying now would record the replay. Stop it first (automation_record_stop).` };
       }
+      if (params.dataset) return runDataset(params, cwd, { resolveFlowPath });
 
       let startUrl;
       try {
@@ -845,6 +869,13 @@ export async function runTool(name, params = {}, context = {}) {
           errors.push(`${key}: ${e.message}`);
         }
       }
+      for (const [key, name] of Object.entries(params.exports || {})) {
+        const k = String(key).toLowerCase();
+        const node = fields.find((s) => s.id.toLowerCase() === k) || fields.find((s) => String(s.fieldName || s.label || '').toLowerCase() === k);
+        if (!node) { errors.push(`No field "${key}"`); continue; }
+        if (name) node.exportAs = String(name); else delete node.exportAs;
+        changed = true;
+      }
       if (changed) {
         fs.writeFileSync(fp, JSON.stringify(flow, null, 2), 'utf8');
         // keep the Playwright spec next to the flow in step with the rules
@@ -858,9 +889,9 @@ export async function runTool(name, params = {}, context = {}) {
       const rows = fields.map((s) => {
         const vals = samples.map((p) => p.values[s.id]?.value ?? (p.values[s.id]?.source === 'any' ? '(any option)' : null)).filter((v) => v != null);
         const shown = s.sensitive || s.data?.mode === 'secret' ? '••••' : s.value;
-        return { nodeId: s.id, field: s.fieldName || s.label, action: s.action, recorded: shown, rule: s.data, ruleText: describeRule(s.data), why: s.data?.why || '', samples: vals };
+        return { nodeId: s.id, field: s.fieldName || s.label, action: s.action, recorded: shown, rule: s.data, ruleText: describeRule(s.data), why: s.data?.why || '', samples: vals, exportAs: s.exportAs || undefined };
       });
-      const lines = rows.map((r) => `${r.nodeId} ${r.field}: ${r.ruleText}${r.why ? ` (${r.why})` : ''}; recorded "${r.recorded}"${r.samples.length ? ` → next runs e.g. ${r.samples.map((v) => `"${v}"`).join(', ')}` : ''}`);
+      const lines = rows.map((r) => `${r.nodeId} ${r.field}: ${r.ruleText}${r.why ? ` (${r.why})` : ''}; recorded "${r.recorded}"${r.samples.length ? ` → next runs e.g. ${r.samples.map((v) => `"${v}"`).join(', ')}` : ''}${r.exportAs ? ` · publishes {{var:${r.exportAs}}}` : ''}`);
       return {
         ok: errors.length === 0,
         text: `Test data of "${flow.name}"${changed ? ' (saved)' : ''}:\n${lines.join('\n')}${errors.length ? `\n\nProblems: ${errors.join('; ')}` : ''}\n\nModes: ${DATA_MODES.join(', ')}. Kinds: ${DATA_KINDS.join(', ')}.`,

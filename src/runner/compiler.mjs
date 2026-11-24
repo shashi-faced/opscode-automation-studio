@@ -3,10 +3,22 @@ import path from 'node:path';
 
 /** A value for the spec: {{secret:x}} / {{input:x}} become environment variables. */
 function valueCode(v) {
-  const m = /^\{\{(secret|input):([^}]+)\}\}$/.exec(String(v ?? ''));
-  if (!m) return JSON.stringify(String(v ?? ''));
-  const env = m[2].toUpperCase().replace(/[^A-Z0-9]+/g, '_');
-  return `process.env.${env} ?? ''`;
+  const s = String(v ?? '');
+  const m = /^\{\{(secret|input):([^}]+)\}\}$/.exec(s);
+  if (m) {
+    const env = m[2].toUpperCase().replace(/[^A-Z0-9]+/g, '_');
+    return `process.env.${env} ?? ''`;
+  }
+  // {{var:x}}: a value read or published earlier in this test, else an environment variable
+  if (/\{\{var:[^}]+\}\}/.test(s)) {
+    const parts = s.split(/(\{\{var:[^}]+\}\})/).filter(Boolean).map((p) => {
+      const v2 = /^\{\{var:([^}]+)\}\}$/.exec(p);
+      if (!v2) return p.replace(/[`\\$]/g, '\\$&');
+      return `\${vars[${JSON.stringify(v2[1])}] ?? process.env.VAR_${v2[1].toUpperCase().replace(/[^A-Z0-9]+/g, '_')} ?? ''}`;
+    });
+    return '`' + parts.join('') + '`';
+  }
+  return JSON.stringify(s);
 }
 
 /** The main path of a flow graph: from the entry, following next / yes edges. */
@@ -93,16 +105,40 @@ export function buildPlaywrightLocatorWithFallbacks(step) {
 export function compileStepToCode(step, index, options = {}) {
   const act = (step.action || '').toLowerCase();
   const desc = step.description ? `// Step ${index + 1}: ${step.description}` : `// Step ${index + 1}: ${act}`;
-  const locatorCode = buildPlaywrightLocatorCode(step, options);
+  let locatorCode = buildPlaywrightLocatorCode(step, options);
+  // inside an iframe
+  const frameSel = step.frame ? (step.frame.selector || (step.frame.name ? `iframe[name="${step.frame.name}"]` : null)) : null;
+  if (frameSel) locatorCode = locatorCode.replace(/^page\./, `page.frameLocator(${JSON.stringify(frameSel)}).`);
+  // the next step is a dialog this action opens: answer it first
+  const pre = options.nextDialog ? `page.once('dialog', (d) => ${options.nextDialog.accept === false ? 'd.dismiss()' : `d.accept(${options.nextDialog.text != null ? JSON.stringify(String(options.nextDialog.text)) : ''})`});\n    ` : '';
+  const out = compileOne(step, act, desc, locatorCode, index, options);
+  return pre ? out.replace(/\n    /, `\n    ${pre}`) : out;
+}
 
+function compileOne(step, act, desc, locatorCode, index, options) {
   switch (act) {
+    case 'hover':
+      return `${desc}\n    await ${locatorCode}.hover();`;
+    case 'upload':
+      return `${desc}\n    await ${locatorCode}.setInputFiles(${JSON.stringify((step.files || []).map((f) => `files/${String(f).split('/').pop()}`))});`;
+    case 'drag': {
+      const to = buildPlaywrightLocatorCode({ selectorSet: step.to || {} }, options);
+      return `${desc}\n    await ${locatorCode}.dragTo(${to});`;
+    }
+    case 'dialog':
+      return `${desc}\n    // dialog answered by the handler set before the previous step`;
+    case 'extract': {
+      const src = step.selectorSet ? locatorCode : `page.locator('body')`;
+      const pat = step.pattern ? `.match(new RegExp(${JSON.stringify(step.pattern)}, 'i'))` : '';
+      return `${desc}\n    { const t = (await ${src}.innerText()).replace(/\\s+/g, ' ').trim();${step.pattern ? ` const m = t${pat}; expect(m, ${JSON.stringify(`pattern ${step.pattern}`)}).toBeTruthy(); vars[${JSON.stringify(step.name)}] = (m![1] ?? m![0]);` : ` vars[${JSON.stringify(step.name)}] = t;`} }`;
+    }
     case 'goto':
     case 'navigate': {
       let targetUrl = step.url || step.value || '';
       if (targetUrl && !/^https?:\/\//i.test(targetUrl) && !targetUrl.startsWith('file://')) {
         targetUrl = 'https://' + targetUrl;
       }
-      return `${desc}\n    await page.goto(${JSON.stringify(targetUrl)}, { waitUntil: 'domcontentloaded' });`;
+      return `${desc}\n    await page.goto(${valueCode(targetUrl)}, { waitUntil: 'domcontentloaded' });`;
     }
     case 'click': {
       return `${desc}\n    await ${locatorCode}.click();`;
@@ -111,7 +147,7 @@ export function compileStepToCode(step, index, options = {}) {
       if (options.fresh && options.fresh.has(String(step.value))) {
         return `${desc} (new test data each run: ${step.data?.kind || 'text'})\n    await ${locatorCode}.fill(DATA[${JSON.stringify(String(step.value))}]);`;
       }
-      return `${desc}\n    await ${locatorCode}.fill(${valueCode(step.value)});`;
+      return `${desc}\n    await ${locatorCode}.fill(${valueCode(step.value)});${step.exportAs ? `\n    vars[${JSON.stringify(step.exportAs)}] = await ${locatorCode}.inputValue();` : ''}`;
     }
     case 'select': {
       const val = step.value ?? '';
@@ -165,14 +201,16 @@ export function compileStepToCode(step, index, options = {}) {
 export function compileFlowToSpec(flowInput, options = {}) {
   const flow = typeof flowInput === 'string' ? JSON.parse(flowInput) : flowInput;
   const flowName = flow.name || 'recorded-flow';
-  const steps = mainPath(flow);
+  // a given path (node ids, e.g. a branch) or the main path
+  const byIdAll = new Map((flow.steps || []).map((s) => [s.id, s]));
+  const steps = Array.isArray(options.path) ? options.path.map((id) => byIdAll.get(id)).filter(Boolean) : mainPath(flow);
 
   // Fields with a "generate" data rule get a fresh value each run (recorded value + a run tag).
   const fresh = new Map();
   for (const s of steps) {
     if (s.action === 'fill' && s.data?.mode === 'generate' && s.value != null && !/^\{\{/.test(String(s.value))) fresh.set(String(s.value), s.data.kind || 'text');
   }
-  const stepCodes = steps.map((s, i) => compileStepToCode(s, i, { ...options, fresh })).join('\n\n    ');
+  const stepCodes = steps.map((s, i) => compileStepToCode(s, i, { ...options, fresh, nextDialog: steps[i + 1]?.action === 'dialog' ? steps[i + 1] : null })).join('\n\n    ');
   const dataBlock = fresh.size
     ? `
 // Test data: these fields get a new value on every run, so repeated runs do not clash.
@@ -197,7 +235,8 @@ ${dataBlock}
  * Steps: ${steps.length}
  */
 test.describe(${JSON.stringify(flowName)}, () => {
-  test('execute recorded journey', async ({ page }) => {
+  test(${JSON.stringify(options.testTitle || 'execute recorded journey')}, async ({ page }) => {
+    const vars: Record<string, string> = {};
     // Set default viewport
     await page.setViewportSize({ width: 1280, height: 800 });
 

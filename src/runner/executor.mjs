@@ -10,6 +10,32 @@ import { readSecrets } from '../flow/secrets.mjs';
 import { robustClick, robustFill, robustPress } from '../flow/input.mjs';
 import { planRunData, stepForRun, readHistory, readRunValues, rememberValues } from '../data/runData.mjs';
 import { recordRunIssues } from '../issues/tracker.mjs';
+import { scopeFor, resolveUploadFiles } from '../flow/frames.mjs';
+import { readVars, saveVars, extractFrom } from '../data/vars.mjs';
+import { requestPattern } from '../recorder/recorder.mjs';
+
+/**
+ * Requests saved on a node while recording (POST/PUT/PATCH/DELETE after the action) must happen
+ * again and succeed. `logs` are the flight recorder's network logs.
+ */
+export async function checkStepRequests(step, logs, since, { timeoutMs = 6000 } = {}) {
+  const wanted = (step.requests || []).filter((r) => !r.status || r.status < 400);
+  if (!wanted.length || !Array.isArray(logs)) return [];
+  const end = Date.now() + timeoutMs;
+  const seen = [];
+  for (const w of wanted) {
+    let hit = null;
+    while (!hit) {
+      hit = logs.find((l) => l.timestamp >= since && String(l.method).toUpperCase() === w.method && requestPattern(l.url) === w.pattern) || null;
+      if (hit || Date.now() > end) break;
+      await new Promise((r) => setTimeout(r, 150));
+    }
+    if (!hit) throw new Error(`Expected the app to send ${w.method} ${w.pattern} (it did when recorded), but no such request was made`);
+    if (hit.failed || hit.status >= 400) throw new Error(`Server call failed: ${w.method} ${w.pattern} -> ${hit.status || hit.errorText || 'no response'}`);
+    seen.push({ method: w.method, pattern: w.pattern, status: hit.status });
+  }
+  return seen;
+}
 
 /** Texts the page shows about a problem: alerts, error boxes, field validation messages. */
 async function capturePageMessages(page) {
@@ -30,7 +56,7 @@ async function capturePageMessages(page) {
   }).catch(() => []);
 }
 
-const RESULT_CHECK_ACTIONS = new Set(['goto', 'navigate', 'click', 'press', 'select', 'check', 'uncheck']);
+const RESULT_CHECK_ACTIONS = new Set(['goto', 'navigate', 'click', 'press', 'select', 'check', 'uncheck', 'drag', 'dialog']);
 
 /** After an action that changed the page while recording, wait until replay reaches the same page. */
 async function checkStepResult(page, step, timeoutMs = 10000) {
@@ -57,6 +83,12 @@ async function checkStepResult(page, step, timeoutMs = 10000) {
 async function executeLocatorAction(locator, act, step) {
   const real = typeof locator?.page === 'function' && typeof locator?.boundingBox === 'function';
   switch (act) {
+    case 'hover':
+      await locator.hover({ timeout: 5000 });
+      break;
+    case 'upload':
+      await locator.setInputFiles(step.uploadPaths || [], { timeout: 5000 });
+      break;
     case 'click':
       if (real) await robustClick(locator.page(), locator);
       else await locator.click({ timeout: 5000 });
@@ -172,8 +204,28 @@ export async function runFlow(session, flowInput, options = {}) {
   // recorded values ("recorded"), or the values of an earlier run (replayRun).
   const dataMode = options.dataMode === 'recorded' ? 'recorded' : 'fresh';
   const replayValues = options.replayRun ? readRunValues(cwd, options.replayRun) : null;
-  const plan = planRunData(flow, { mode: dataMode, seed: options.seed, history: readHistory(cwd), replayValues });
+  const plan = planRunData(flow, { mode: dataMode, seed: options.seed, history: readHistory(cwd), replayValues, overrides: options.overrides || null, overrideSource: options.overrideSource || 'given' });
   const dataUsed = [];
+  let lastStepStart = 0;
+  let prevStepStart = 0;
+  // Variables: saved ones (from earlier flows), plus any given for this run; values set during the
+  // run (exportAs, extract) are saved at the end.
+  const vars = { ...readVars(cwd), ...(options.vars || {}) };
+  const varsSet = {};
+  // Browser dialogs: answered as the flow's next "dialog" node says (armed before the action).
+  let dialogPolicy = null;
+  let dialogSeen = null;
+  const onDialog = async (dialog) => {
+    dialogSeen = { type: dialog.type(), message: dialog.message(), at: Date.now() };
+    try {
+      if (dialogPolicy && dialogPolicy.accept === false) await dialog.dismiss();
+      else if (dialogPolicy) await dialog.accept(dialogPolicy.text != null ? String(dialogPolicy.text) : undefined);
+      else await dialog.dismiss();
+    } catch {}
+    if (!dialogPolicy) unexpectedDialogs.push({ type: dialogSeen.type, message: String(dialogSeen.message).slice(0, 200), nodeId: currentId });
+  };
+  const unexpectedDialogs = [];
+  if (page && typeof page.on === 'function') page.on('dialog', onDialog);
   const pathTaken = [];
   let currentId = options.fromNode || flow.entry;
   let idx = -1;
@@ -188,8 +240,9 @@ export async function runFlow(session, flowInput, options = {}) {
     if (!rawStep) break;
     pathTaken.push(rawStep.id);
     const planned = stepForRun(rawStep, plan);
-    const step = { ...planned, value: resolveValue(planned.value, { inputs, secrets }), random: plan.rng.next };
-    const missingSecret = typeof step.value === 'string' && /\{\{(secret|input):[^}]+\}\}/.test(step.value);
+    const step = { ...planned, value: resolveValue(planned.value, { inputs, secrets, vars }), random: plan.rng.next };
+    if (step.url) step.url = resolveValue(step.url, { inputs, secrets, vars });
+    const missingSecret = typeof step.value === 'string' && /\{\{(secret|input|var):[^}]+\}\}/.test(step.value);
     const act = (step.action || '').toLowerCase();
     const noteData = () => {
       if (act !== 'fill' && act !== 'select') return;
@@ -208,7 +261,9 @@ export async function runFlow(session, flowInput, options = {}) {
 
     const stepIndex = idx + 1;
     let outcome;
+    prevStepStart = lastStepStart;
     const stepStartTime = Date.now();
+    lastStepStart = stepStartTime;
 
     recorder.setStep(stepIndex, { action: act, description: step.description });
 
@@ -222,7 +277,16 @@ export async function runFlow(session, flowInput, options = {}) {
 
     try {
       if (missingSecret) {
+        const v = /\{\{var:([^}]+)\}\}/.exec(step.value);
+        if (v) throw new Error(`Missing value: variable "${v[1]}" is not set. Run the flow that sets it first (a fill with exportAs "${v[1]}" or an extract step), or pass it in inputs.`);
         throw new Error(`Missing value ${step.value} for "${rawStep.label || rawStep.description}": add it to automation/.secrets.json or pass it in inputs.`);
+      }
+      // the next node is a dialog: answer it the way it says when this action opens it
+      {
+        const nextId = nextNodeId(flow, rawStep.id, undefined);
+        const nextNode = nextId ? getNode(flow, nextId) : null;
+        dialogPolicy = nextNode && nextNode.action === 'dialog' ? { accept: nextNode.accept !== false, text: nextNode.text } : null;
+        if (dialogPolicy) dialogSeen = null;
       }
       switch (act) {
         case 'goto':
@@ -265,17 +329,62 @@ export async function runFlow(session, flowInput, options = {}) {
           break;
         }
 
+        case 'dialog': {
+          // the previous action opened a dialog (answered by the handler above)
+          const end = Date.now() + (options.timeout || 5000);
+          while (!dialogSeen && Date.now() < end) await new Promise((r) => setTimeout(r, 100));
+          if (!dialogSeen) throw new Error(`Expected a browser dialog${rawStep.message ? ` ("${String(rawStep.message).slice(0, 60)}")` : ''}, but none appeared`);
+          layerUsed = `DIALOG:${step.accept === false ? 'dismissed' : 'accepted'}`;
+          dialogSeen = null;
+          break;
+        }
+
+        case 'extract': {
+          if (!page) break;
+          const scope = step.frame ? await scopeFor(page, step.frame) : page;
+          let text;
+          if (step.selectorSet && Object.values(step.selectorSet).some((v) => typeof v === 'string' && v)) {
+            const res = await resolver.resolve(scope, step.selectorSet, step.description, step);
+            text = await res.locator.innerText({ timeout: 5000 });
+          } else {
+            text = await scope.locator('body').innerText({ timeout: 5000 });
+          }
+          const val = extractFrom(text, step.pattern);
+          if (step.name) { vars[step.name] = val; varsSet[step.name] = val; }
+          step.value = val;
+          layerUsed = `EXTRACT:${step.name || ''}`;
+          break;
+        }
+
+        case 'drag': {
+          if (!page) break;
+          const scope = step.frame ? await scopeFor(page, step.frame) : page;
+          const from = await resolver.resolve(scope, step.selectorSet, step.description, step);
+          const to = await resolver.resolve(scope, step.to, `drop target of ${step.description}`, {});
+          await from.locator.dragTo(to.locator, { timeout: 5000 });
+          layerUsed = from.layerUsed;
+          break;
+        }
+
         case 'click':
         case 'fill':
         case 'select':
         case 'check':
         case 'uncheck':
         case 'press':
+        case 'hover':
+        case 'upload':
         case 'assert':
         case 'assert_visible': {
           if (!page) break;
+          const scope = step.frame ? await scopeFor(page, step.frame) : page;
+          if (act === 'upload') {
+            const up = resolveUploadFiles(cwd, step.files);
+            step.uploadPaths = up.paths;
+            if (up.created.length) layerUsed = `placeholder files: ${up.created.join(', ')}`;
+          }
           try {
-            const res = await resolver.resolve(page, step.selectorSet, step.description, step);
+            const res = await resolver.resolve(scope, step.selectorSet, step.description, step);
             layerUsed = res.layerUsed;
             healed = res.healed;
             healedStrategy = res.strategy || '';
@@ -313,7 +422,7 @@ export async function runFlow(session, flowInput, options = {}) {
               }
 
               try {
-                const retryRes = await resolver.resolve(page, step.selectorSet, step.description, step);
+                const retryRes = await resolver.resolve(scope, step.selectorSet, step.description, step);
                 await executeLocatorAction(retryRes.locator, act, step);
                 healed = true;
                 healedStrategy = 'BACKOFF_RETRY';
@@ -339,7 +448,7 @@ export async function runFlow(session, flowInput, options = {}) {
 
                 if (retryAi.recommendedAction === 'HEAL_AND_CONTINUE' && retryAi.selectedCandidate?.selector) {
                   const candSelector = retryAi.selectedCandidate.selector;
-                  const healedLoc = page.locator(candSelector).first();
+                  const healedLoc = scope.locator(candSelector).first();
                   await healedLoc.waitFor({ state: 'attached', timeout: 4000 });
                   await executeLocatorAction(healedLoc, act, step);
 
@@ -372,7 +481,7 @@ export async function runFlow(session, flowInput, options = {}) {
                 await page.waitForTimeout(500);
 
                 // Retry original locator resolution
-                const retryRes = await resolver.resolve(page, step.selectorSet, step.description, step);
+                const retryRes = await resolver.resolve(scope, step.selectorSet, step.description, step);
                 await executeLocatorAction(retryRes.locator, act, step);
                 healed = true;
                 healedStrategy = 'DISMISS_OVERLAY';
@@ -391,7 +500,7 @@ export async function runFlow(session, flowInput, options = {}) {
             ) {
               // Action: Heal with nearby candidate element discovered by AI
               const candSelector = aiDiagnosis.selectedCandidate.selector;
-              const healedLoc = page.locator(candSelector).first();
+              const healedLoc = scope.locator(candSelector).first();
               await healedLoc.waitFor({ state: 'attached', timeout: 4000 });
               await executeLocatorAction(healedLoc, act, step);
 
@@ -448,6 +557,17 @@ export async function runFlow(session, flowInput, options = {}) {
       if (RESULT_CHECK_ACTIONS.has(act) && act !== 'goto' && act !== 'navigate') {
         await page?.waitForLoadState?.('domcontentloaded', { timeout: 10000 }).catch(() => {});
         await checkStepResult(page, step);
+      }
+      // the server calls this action made when recorded must happen again and succeed
+      if (page && options.checkRequests !== false && Array.isArray(rawStep.requests) && rawStep.requests.length) {
+        const all = recorder.getAllTelemetry?.().networkLogs || recorder.networkLogs || [];
+        // a dialog's requests are sent while the action before it (that opened it) runs
+        await checkStepRequests(rawStep, all, act === 'dialog' && prevStepStart ? prevStepStart : stepStartTime);
+      }
+      // publish the value this fill used (for later steps and other flows)
+      if (rawStep.exportAs && (act === 'fill' || act === 'select') && step.value != null) {
+        vars[rawStep.exportAs] = String(step.value);
+        varsSet[rawStep.exportAs] = String(step.value);
       }
 
       const durationMs = Date.now() - stepStartTime;
@@ -601,7 +721,16 @@ export async function runFlow(session, flowInput, options = {}) {
     currentId = nextNodeId(flow, rawStep.id, outcome);
   }
 
+  // A flow that ends with a click (e.g. a form submit): let the page change it starts finish, so
+  // the next run or step does not cancel it.
+  const lastAct = String(getNode(flow, pathTaken[pathTaken.length - 1])?.action || '');
+  if (page && ['click', 'press', 'dialog'].includes(lastAct) && typeof page.waitForEvent === 'function') {
+    await page.waitForEvent('framenavigated', { timeout: 1500 }).catch(() => {});
+    await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
+  }
   recorder.stop();
+  if (page && typeof page.off === 'function') page.off('dialog', onDialog);
+  try { saveVars(cwd, varsSet, { flowId: flow.id || flowSlug, runId }); } catch {}
 
   const durationMs = Date.now() - flowStartTime;
   const ok = failedCount === 0;
@@ -633,11 +762,13 @@ export async function runFlow(session, flowInput, options = {}) {
     replayRun: options.replayRun || undefined,
     dataSeed: plan.seed,
     dataUsed: dataUsed.map(({ at, ...d }) => d),
+    varsSet: Object.keys(varsSet).length ? varsSet : undefined,
+    unexpectedDialogs: unexpectedDialogs.length ? unexpectedDialogs : undefined,
     summary: `${ok ? 'SUCCESS' : 'FAILED'}: ${passedCount}/${pathTaken.length} steps passed${pathTaken.length !== steps.length ? ` (path of ${pathTaken.length} of ${steps.length} nodes)` : ''} (${healedCount} healed) in ${(durationMs / 1000).toFixed(2)}s`,
   };
 
   // Remember generated values (later runs avoid them) and turn failures into tracked issues.
-  try { rememberValues(cwd, flow.id || flowSlug, runSummary.dataUsed); } catch {}
+  try { rememberValues(cwd, flow.id || flowSlug, runSummary.dataUsed, { created: ok && !options.untilNode && !options.fromNode && options.overrideSource !== 'negative' }); } catch {}
   if (options.trackIssues !== false) {
     try { runSummary.issues = recordRunIssues(cwd, flow, runSummary); } catch (e) { runSummary.issues = { error: e.message }; }
   }

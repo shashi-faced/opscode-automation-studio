@@ -176,3 +176,69 @@ load pass (before: every loaded run failed). The agent's own replays never neede
 
 Open (app side, not changed here): the Opscode Browser tab forwards the user's clicks over CDP the
 same way, so after a redirect a user's click can be lost in that tab. Worth checking in the app.
+
+---
+
+# Part 3 (2026-11-24): from "replays what I did" to "tests my module"
+
+1. **Negative and boundary tests.** `automation_flow_negative { flow, fields?, cases? }` derives
+   wrong inputs per form field from its data rule (invalid email, empty, too long, short phone,
+   past/invalid date, number out of range, ...). Each case replays the flow with that one value
+   changed, up to the step that "accepts" the form (the first later step whose recorded result
+   was a new page, or the first later assert). Pass = the app refused it (stayed, showed a
+   message or the browser blocked it); fail = the app accepted it -> issue `validation-missing`.
+2. **Data between flows.** Variables: a fill node can publish its run value (`exportAs`), an
+   `extract` step reads text from the page (target and optional regex) into a variable, and any
+   value can use `{{var:name}}` (or rule `{ mode: "var", name }`). Variables persist in
+   `automation/data/vars.json`, so "Create order" uses the customer "Register customer" made.
+3. **Data sets.** `automation_flow_run { dataset: "file.csv" }` runs once per row; columns map to
+   fields by node id or field name; a per-row report.
+4. **Cleanup.** `automation_cleanup { flow, field?, cleanupFlow? | request? }` deletes what runs
+   created (values in the data history not yet cleaned), through a recorded cleanup flow (value
+   in `{{var:cleanup.value}}`) or an HTTP request template; cleaned values are marked.
+5. **Issues to GitHub.** `automation_issue_export { id, repo? }` opens a GitHub issue with `gh`
+   (after the user agrees); `automation_issue_sync` closes the loop: a closed ticket marks the
+   issue fixed, and the next passing run closes it.
+6. **Rule editor** in the Graph tab: click a step's data badge to change its rule.
+7. **Run history.** `automation_run_history { flow?, feature?, limit? }`: pass rate, flaky steps,
+   slowest steps, from saved runs; a History panel in the Graph tab.
+8. **Nightly regression.** A routine for Automation Studio ("run all flows with new data and
+   report failures, new issues and regressions"), created from the Graph tab.
+9. **More actions:** upload (file), hover, dialog (accept/dismiss, prompt text), iframes (`frame`
+   on a step), drag (to a target). The recorder records uploads, dialogs, drags and steps inside
+   frames.
+10. **Server checks.** During recording, non-GET requests that follow an action are saved on the
+    node (`result.requests`); replay checks the same request happened and succeeded, and reports
+    "POST /api/notes -> 500" or "no request sent".
+11. **Explore.** `automation_explore { url, maxPages }`: crawls same-site links, lists pages,
+    forms (fields) and buttons, and proposes features and flows (`apply: true` lays them out).
+12. **Export.** `automation_export { dir }`: a Playwright project (config, one spec per flow and
+    branch path, data generator, CI workflow) that runs the same flows with new data.
+
+Tests: unit tests per part; the e2e fixture site gains an API notes page (fetch), an iframe, an
+upload, a confirm dialog, drag-and-drop and a hover menu; e2e subtests cover each.
+
+## Status of part 3 (2026-11-24)
+
+All 12 items are done (agent 0.4.0, 28 tools; Store entry 0.4.0). Evidence:
+- `test/e2e_actions.test.mjs` (real Chrome): a note saved through `fetch` keeps `POST /api/notes`
+  on its Save node; replay fails with "Server call failed: POST /api/notes -> 500" when the API
+  breaks; `extract` + `{{var:note.id}}` in a URL; a confirm dialog answered by the agent and one
+  recorded from the user; upload (placeholder file), drag and drop, hover menu, a form in an
+  iframe; an order flow uses the customer the previous flow registered (`exportAs` / rule var).
+- `test/e2e_more.test.mjs`: negative tests (browser- and server-refused values pass; a phone the
+  app accepts opens a validation-missing issue, fixed + re-run closes it; an unescaped name runs a
+  script -> script-injection issue), a CSV data set with expected failures, cleanup by HTTP and by
+  a cleanup flow, run history (flaky steps), explore + lay out, Playwright export, GitHub
+  export/sync with a stand-in `gh`.
+- `test/part3.test.mjs` (unit): cases, acceptance point, verdicts, CSV, variables, server checks,
+  labels, branch paths, spec output, issue body.
+- App: rule editor (click a field's data badge), History panel, Nightly routine button,
+  "Invalid data" button, server calls / published variables / iframe on nodes. QA 27/27.
+
+Found and fixed while testing: values typed by a replay leaked into the next recording on the same
+tab (fields are now baselined when recording starts); the recorder inside an iframe recorded the
+agent's typing too (muted in all frames now); a dialog's server call is sent while the action
+before it runs (checked from that step); a flow ending with a form submit could be cut off by the
+next run (it waits for the page change now); cleanup now deletes only records of runs that
+completed. Every tool also takes `workspace` (routines run in their own folder).

@@ -34,7 +34,8 @@ const resultFile = () => path.join(runDir(), 'automation-result.json');
 export const recorderLogFile = () => path.join(runDir(), 'automation-recorder.log');
 
 /** Actions that change the page; a navigation right after one is that action's result. */
-const PAGE_ACTIONS = new Set(['goto', 'navigate', 'click', 'press', 'select', 'check', 'uncheck', 'fill']);
+const PAGE_ACTIONS = new Set(['goto', 'navigate', 'click', 'press', 'select', 'check', 'uncheck', 'fill', 'upload', 'drag', 'hover', 'dialog']);
+const REQUEST_WINDOW_MS = 4000;
 const NAV_RESULT_WINDOW_MS = 4000;
 
 // In-memory active recording (in the daemon, or in-process in tests)
@@ -116,11 +117,19 @@ export function getRecorderInjectionScript(flowName = '', recId = '') {
       window.__opscodeRecId = REC_ID;
       window.__opscodeRecorderMuted = false;
       window.__opscodeRecordingState = { recId: REC_ID, isRecording: true, isPaused: false, flowName: ${JSON.stringify(flowName)}, steps: [], startTime: Date.now() };
+      // What is already in the fields (typed by a replay or before this recording) is not this
+      // recording's input.
+      try { document.querySelectorAll('input, textarea').forEach(function(el) { el.__opscodeLastRecordedValue = el.value; }); } catch {}
     }
     return;
   }
   window.__opscodeRecorderInjected = true;
   window.__opscodeRecId = REC_ID;
+  // Pre-filled values (an edit form) are the page's, not the user's input: start from them.
+  (function baseline() {
+    var mark = function() { try { document.querySelectorAll('input, textarea').forEach(function(el) { if (el.__opscodeLastRecordedValue === undefined && el.value) el.__opscodeLastRecordedValue = el.value; }); } catch {} };
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', mark, { once: true }); else mark();
+  })();
 
   // Initialize or restore in-page state
   if (!window.__opscodeRecordingState) {
@@ -317,6 +326,7 @@ export function getRecorderInjectionScript(flowName = '', recId = '') {
         placeholder: el.getAttribute('placeholder') || undefined,
         autocomplete: el.getAttribute('autocomplete') || undefined,
         maxLength: el.maxLength > 0 ? el.maxLength : undefined,
+        required: el.required ? true : undefined,
       },
       boundingBox: {
         x: Math.round(rect.x + window.scrollX),
@@ -337,7 +347,19 @@ export function getRecorderInjectionScript(flowName = '', recId = '') {
     if (window.__opscodeRecordingState && window.__opscodeRecordingState.isPaused) return;
     if (!window.__opscodeRecordingState || !window.__opscodeRecordingState.isRecording) return;
 
-    step.url = step.url || window.location.href;
+    if (window !== window.top) {
+      // A step inside an iframe: say which frame, so replay looks for the element there.
+      let selector = null;
+      try {
+        const fe = window.frameElement;
+        if (fe) selector = fe.id ? '#' + CSS.escape(fe.id) : fe.getAttribute('name') ? 'iframe[name="' + fe.getAttribute('name') + '"]' : fe.getAttribute('src') ? 'iframe[src="' + fe.getAttribute('src') + '"]' : null;
+      } catch {}
+      step.frame = { url: window.location.href, name: window.name || undefined, selector: selector || undefined };
+      // the page of a frame step is the top page; the frame's own URL is in step.frame
+      step.url = step.url || '';
+    } else {
+      step.url = step.url || window.location.href;
+    }
     step.pageTitle = document.title || '';
     step.rec = window.__opscodeRecId || REC_ID;
     window.__opscodeRecordingState.steps.push(step);
@@ -456,6 +478,26 @@ export function getRecorderInjectionScript(flowName = '', recId = '') {
     });
   }, true);
 
+  // Drag and drop (HTML5): the dragged element and where it was dropped.
+  let dragSource = null;
+  document.addEventListener('dragstart', function(e) {
+    if (isInsideSidebar(e.target)) return;
+    dragSource = e.target && e.target.closest ? (e.target.closest('[draggable="true"]') || e.target) : e.target;
+  }, true);
+  document.addEventListener('drop', function(e) {
+    if (!dragSource || isInsideSidebar(e.target)) return;
+    const target = e.target.closest ? (e.target.closest('[data-testid], [id], [role], li, section, div') || e.target) : e.target;
+    const from = dragSource;
+    dragSource = null;
+    recordStep({
+      action: 'drag',
+      selectorSet: extractSelectorSet(from),
+      to: extractSelectorSet(target),
+      description: 'Drag "' + (getVisibleText(from) || from.tagName.toLowerCase()).slice(0, 30) + '" to "' + (getVisibleText(target) || target.id || target.tagName.toLowerCase()).slice(0, 30) + '"',
+      timestamp: Date.now(),
+    });
+  }, true);
+
   // Debounced input tracker for text inputs & textareas
   document.addEventListener('input', function(e) {
     if (isInsideSidebar(e.target)) return;
@@ -475,6 +517,21 @@ export function getRecorderInjectionScript(flowName = '', recId = '') {
     if (isInsideSidebar(e.target)) return;
     const el = e.target;
     const tag = el.tagName.toLowerCase();
+    if (tag === 'input' && (el.type || '').toLowerCase() === 'file') {
+      clearTimeout(inputDebounceTimer);
+      flushAllInputs();
+      const names = Array.from(el.files || []).map(function(f) { return f.name; });
+      if (!names.length) return;
+      recordStep({
+        action: 'upload',
+        selectorSet: extractSelectorSet(el),
+        files: names,
+        fieldName: getAssociatedLabel(el) || el.name || el.id || 'file',
+        description: 'Upload ' + names.join(', '),
+        timestamp: Date.now(),
+      });
+      return;
+    }
     if (tag === 'input' || tag === 'textarea' || tag === 'select') {
       // A value typed elsewhere comes first: record it before this choice.
       if (tag === 'select' || el.type === 'checkbox' || el.type === 'radio') {
@@ -599,6 +656,11 @@ function handleIncomingStep(step) {
   const key = stepKey(step);
   if (rec.seen.has(key)) return null;
   rec.seen.add(key);
+  // one dialog is recorded once (by the agent's step or by the recorder, whichever comes first)
+  if (action === 'dialog') {
+    const prev = rec.builder.flow.steps[rec.builder.flow.steps.length - 1];
+    if (prev && prev.action === 'dialog' && Math.abs((prev.timestamp || 0) - (step.timestamp || 0)) < 3000) return null;
+  }
 
   const node = rec.builder.add(cleanStep({ ...step, action }));
   if (PAGE_ACTIONS.has(action)) {
@@ -683,6 +745,50 @@ function attachPageEvents(page) {
     } catch {}
   });
   page.on('load', () => onLoaded(page));
+  // A browser dialog (alert / confirm / prompt) while recording: record it and accept it, as the
+  // user went on with the flow. The agent's automation_step answers its own dialogs first.
+  page.on('dialog', (dialog) => {
+    setTimeout(() => {
+      const accepted = dialog.type() !== 'beforeunload';
+      const p = accepted ? dialog.accept(dialog.type() === 'prompt' ? dialog.defaultValue() : undefined) : dialog.dismiss();
+      Promise.resolve(p).then(() => {
+        handleIncomingStep({ action: 'dialog', accept: true, dialogType: dialog.type(), message: dialog.message().slice(0, 200), description: `Accept ${dialog.type()} "${dialog.message().slice(0, 40)}"`, timestamp: Date.now(), source: 'user' });
+      }).catch(() => {});
+    }, 250);
+  });
+  // Requests that change data (POST, PUT, PATCH, DELETE) right after an action: saved on that
+  // action's node, and checked on replay.
+  const onRequestDone = async (req, failed) => {
+    try {
+      const rec = activeRecording;
+      if (!rec || !rec.isRecording || !rec.lastActionNodeId) return;
+      const method = req.method();
+      if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') return;
+      if (!['fetch', 'xhr', 'document'].includes(req.resourceType())) return;
+      if (Date.now() - (rec.lastActionAt || 0) > REQUEST_WINDOW_MS) return;
+      const node = getNode(rec.builder.flow, rec.lastActionNodeId);
+      if (!node) return;
+      let status = 0;
+      if (!failed) { try { status = (await req.response())?.status() || 0; } catch {} }
+      const url = req.url();
+      const reqs = node.requests || (node.requests = []);
+      if (reqs.some((r) => r.method === method && r.pattern === requestPattern(url))) return;
+      reqs.push({ method, url, pattern: requestPattern(url), status, kind: req.resourceType() });
+      persist();
+    } catch {}
+  };
+  page.on('requestfinished', (req) => onRequestDone(req, false));
+  page.on('requestfailed', (req) => onRequestDone(req, true));
+}
+
+/** Host + path of a request with ids replaced, for matching the same call on replay. */
+export function requestPattern(url) {
+  try {
+    const u = new URL(url);
+    return u.pathname.split('/').map((seg) => (/^\d+$|^[0-9a-f-]{16,}$/i.test(seg) ? ':id' : seg)).join('/');
+  } catch {
+    return String(url || '');
+  }
 }
 
 function normalizeUrl(u) {

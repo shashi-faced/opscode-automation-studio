@@ -11,7 +11,7 @@ const CITIES = ['Delhi', 'Mumbai', 'Bengaluru', 'Pune', 'Chennai', 'Hyderabad', 
 const WORDS = ['alpha', 'river', 'maple', 'orbit', 'pixel', 'cedar', 'harbor', 'falcon', 'quartz', 'meadow', 'ember', 'summit', 'willow', 'comet', 'lotus', 'atlas'];
 
 export const DATA_KINDS = ['email', 'fullName', 'firstName', 'lastName', 'username', 'phone', 'number', 'date', 'company', 'street', 'city', 'zip', 'url', 'sentence', 'text', 'pattern'];
-export const DATA_MODES = ['generate', 'fixed', 'list', 'any', 'secret'];
+export const DATA_MODES = ['generate', 'fixed', 'list', 'any', 'secret', 'var'];
 
 /** Seeded random source (mulberry32). */
 export function makeRandom(seed = Date.now()) {
@@ -201,6 +201,8 @@ export function suggestRule(step, { signInPage = false } = {}) {
   const value = step.value;
   if (step.action === 'select') return { mode: 'fixed', why: 'option kept as recorded (set mode "any" for a random option)', source: 'auto' };
   if (/^\{\{secret:[^}]+\}\}$/.test(String(value || '')) || step.sensitive) return { mode: 'secret', why: 'password or secret', source: 'auto' };
+  const varRef = /^\{\{var:([^}]+)\}\}$/.exec(String(value || ''));
+  if (varRef) return { mode: 'var', name: varRef[1], why: 'value from another step or flow', source: 'auto' };
   if (/^\{\{input:[^}]+\}\}$/.test(String(value || ''))) return { mode: 'fixed', why: 'given as a run input', source: 'auto' };
   if (signInPage) return { mode: 'fixed', why: 'sign-in form: must match an existing account', source: 'auto' };
   if (FIXED_FIELDS.test(info.text)) return { mode: 'fixed', why: 'search/code field: kept as recorded', source: 'auto' };
@@ -255,7 +257,9 @@ export function normalizeRule(input, current = {}) {
   if (input == null) return null;
   if (typeof input === 'string') {
     const s = input.trim();
-    if (DATA_MODES.includes(s)) return { mode: s, source: 'ai' };
+    const v = /^(?:var|\{\{var):([^}]+?)(?:\}\})?$/.exec(s);
+    if (v) return { mode: 'var', name: v[1].trim(), source: 'ai' };
+    if (DATA_MODES.includes(s) && s !== 'var') return { mode: s, source: 'ai' };
     const kind = DATA_KINDS.find((k) => k.toLowerCase() === s.toLowerCase());
     if (kind) return { mode: 'generate', kind, source: 'ai' };
     if (/\{[a-zA-Z]+(:\d+)?\}/.test(s)) return { mode: 'generate', kind: 'pattern', pattern: s, source: 'ai' };
@@ -266,6 +270,7 @@ export function normalizeRule(input, current = {}) {
   if (!input.mode) rule.mode = Array.isArray(input.values) || (input.values != null) ? 'list' : input.kind || input.pattern ? 'generate' : rule.mode || 'fixed';
   if (rule.pattern && !rule.kind) rule.kind = 'pattern';
   if (!DATA_MODES.includes(rule.mode)) throw new Error(`Unknown data mode "${rule.mode}".`);
+  if (rule.mode === 'var' && !rule.name) throw new Error('A "var" rule needs a name, e.g. { mode: "var", name: "customer.email" }.');
   if (rule.mode === 'generate' && !DATA_KINDS.includes(rule.kind)) rule.kind = 'text';
   rule.source = input.source || 'ai';
   return rule;
@@ -278,5 +283,6 @@ export function describeRule(rule) {
   if (rule.mode === 'list') return `one of ${(rule.values || []).length} values`;
   if (rule.mode === 'any') return 'any option';
   if (rule.mode === 'secret') return 'secret';
+  if (rule.mode === 'var') return `from variable ${rule.name}`;
   return 'fixed (recorded value)';
 }

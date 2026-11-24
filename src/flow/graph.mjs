@@ -153,6 +153,11 @@ export function defaultLabel(step) {
     case 'check': return `Check ${t ? `"${clip(t)}"` : 'box'}`;
     case 'uncheck': return `Uncheck ${t ? `"${clip(t)}"` : 'box'}`;
     case 'press': return `Press ${step.key || 'Enter'}`;
+    case 'hover': return t ? `Hover "${clip(t)}"` : 'Hover';
+    case 'upload': return `Upload ${clip((step.files || []).join(', ') || 'file')}`;
+    case 'drag': return `Drag ${t ? `"${clip(t)}"` : 'item'}${step.to?.textSelector ? ` to "${clip(step.to.textSelector)}"` : ''}`;
+    case 'extract': return `Read "${clip(String(step.name || 'value'))}"`;
+    case 'dialog': return `${step.accept === false ? 'Dismiss' : 'Accept'} ${step.dialogType || 'dialog'}`;
     case 'decision': return `If ${describeCondition(step.condition)}`;
     case 'assert_text': return `Expect text "${clip(String(step.value || ''))}"`;
     case 'assert_url': return `Expect URL ${clip(String(step.value || ''))}`;
@@ -221,14 +226,15 @@ export function extractSecrets(flow, flowId) {
   return secrets;
 }
 
-/** Replace {{secret:x}} and {{input:x}} in a value. Unknown names are left as they are. */
-export function resolveValue(value, { inputs = {}, secrets = {} } = {}) {
+/** Replace {{secret:x}}, {{input:x}} and {{var:x}} in a value. Unknown names are left as they are. */
+export function resolveValue(value, { inputs = {}, secrets = {}, vars = {} } = {}) {
   if (typeof value !== 'string') return value;
   const has = (o, k) => o && Object.prototype.hasOwnProperty.call(o, k);
-  return value.replace(/\{\{(secret|input):([^}]+)\}\}/g, (m, kind, name) => {
-    // inputs given for a run win over saved secrets (e.g. replay with a wrong password)
+  return value.replace(/\{\{(secret|input|var):([^}]+)\}\}/g, (m, kind, name) => {
+    // inputs given for a run win over saved secrets and variables (e.g. replay with a wrong password)
     if (has(inputs, name)) return String(inputs[name]);
     if (kind === 'secret' && has(secrets, name)) return String(secrets[name]);
+    if (kind === 'var' && has(vars, name)) return String(vars[name]);
     return m;
   });
 }
@@ -248,7 +254,10 @@ export function summarizeFlowGraph(flow) {
       result: s.result || null,
       condition: s.condition || undefined,
       source: s.source || 'user',
-      data: s.data ? { mode: s.data.mode, kind: s.data.kind, pattern: s.data.pattern, values: s.data.values, why: s.data.why } : undefined,
+      data: s.data ? { mode: s.data.mode, kind: s.data.kind, pattern: s.data.pattern, values: s.data.values, why: s.data.why, name: s.data.name } : undefined,
+      exportAs: s.exportAs || undefined,
+      requests: Array.isArray(s.requests) && s.requests.length ? s.requests.map((r) => ({ method: r.method, pattern: r.pattern, status: r.status })) : undefined,
+      frame: s.frame || undefined,
     })),
     edges: (flow.edges || []).map((e) => ({ id: e.id, source: e.source, target: e.target, kind: e.kind, label: e.label })),
   };
@@ -264,6 +273,9 @@ function inputSummary(s) {
   const out = {};
   if (s.value != null && s.action !== 'decision') out.value = s.sensitive ? '••••' : s.value;
   if (s.key) out.key = s.key;
+  if (s.action === 'upload' && s.files) out.files = s.files;
+  if (s.action === 'extract') { out.name = s.name; if (s.pattern) out.pattern = s.pattern; }
+  if (s.action === 'dialog') out.accept = s.accept !== false;
   if ((s.action === 'goto' || s.action === 'navigate') && s.url) out.url = s.url;
   return Object.keys(out).length ? out : undefined;
 }

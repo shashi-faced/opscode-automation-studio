@@ -47,7 +47,7 @@ const SUBSTITUTABLE = new Set(['email', 'fullName', 'firstName', 'lastName', 'us
  * mode "fresh": nodes with a generate/list rule get new values; "recorded": every node keeps its value.
  * replayValues: { nodeId: value } from an earlier run (wins over generated values).
  */
-export function planRunData(flow, { mode = 'fresh', seed, history = {}, replayValues = null } = {}) {
+export function planRunData(flow, { mode = 'fresh', seed, history = {}, replayValues = null, overrides = null, overrideSource = 'given' } = {}) {
   const runSeed = seed ?? ((Date.now() ^ Math.floor(Math.random() * 0x7fffffff)) >>> 0);
   const rng = makeRandom(runSeed);
   const runTag = rng.tag(4);
@@ -61,7 +61,11 @@ export function planRunData(flow, { mode = 'fresh', seed, history = {}, replayVa
     if (s.action !== 'fill' && s.action !== 'select') continue;
     const rule = s.data || null;
     const recorded = s.value;
-    if (replayValues && Object.prototype.hasOwnProperty.call(replayValues, s.id)) {
+    if (overrides && Object.prototype.hasOwnProperty.call(overrides, s.id)) {
+      values[s.id] = { value: String(overrides[s.id]), source: overrideSource };
+    } else if (rule?.mode === 'var' && rule.name) {
+      values[s.id] = { value: `{{var:${rule.name}}}`, source: `var:${rule.name}` };
+    } else if (replayValues && Object.prototype.hasOwnProperty.call(replayValues, s.id)) {
       values[s.id] = { value: String(replayValues[s.id]), source: 'replay' };
     } else if (mode === 'fresh' && rule && (rule.mode === 'generate' || rule.mode === 'list')) {
       const same = recorded != null && byRecorded.get(String(recorded));
@@ -130,7 +134,7 @@ export function stepForRun(step, plan) {
 }
 
 /** Remember the generated values of a finished run, so later runs avoid them. */
-export function rememberValues(cwd, flowId, dataUsed) {
+export function rememberValues(cwd, flowId, dataUsed, { created = false } = {}) {
   const generated = (dataUsed || []).filter((d) => d.source === 'generated' && d.value != null);
   if (!generated.length) return;
   const history = readHistory(cwd);
@@ -141,5 +145,16 @@ export function rememberValues(cwd, flowId, dataUsed) {
     h[d.nodeId] = list.slice(-HISTORY_KEEP);
   }
   history[flowId] = h;
+  // values of runs that went all the way through: records that now exist in the app (for cleanup)
+  if (created) {
+    const c = (history.__created ||= {});
+    const ch = (c[flowId] ||= {});
+    for (const d of generated) ch[d.nodeId] = [...(ch[d.nodeId] || []), String(d.value)].slice(-HISTORY_KEEP);
+  }
   writeHistory(cwd, history);
+}
+
+/** Values of runs that completed (records the app now has), by node. */
+export function createdValues(cwd, flowId, nodeId) {
+  return readHistory(cwd).__created?.[flowId]?.[nodeId] || [];
 }

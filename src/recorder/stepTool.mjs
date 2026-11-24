@@ -6,8 +6,11 @@ import { locatorFromTarget, evaluateCondition } from '../flow/targets.mjs';
 import { defaultLabel } from '../flow/graph.mjs';
 import { robustClick, robustFill, robustPress } from '../flow/input.mjs';
 import { normalizeRule } from '../data/generate.mjs';
+import { scopeFor, resolveUploadFiles } from '../flow/frames.mjs';
+import { readVars, saveVars, extractFrom } from '../data/vars.mjs';
+import { resolveValue } from '../flow/graph.mjs';
 
-export const STEP_ACTIONS = ['goto', 'click', 'fill', 'select', 'check', 'uncheck', 'press', 'assert_visible', 'assert_text', 'assert_url', 'wait', 'decision'];
+export const STEP_ACTIONS = ['goto', 'click', 'fill', 'select', 'check', 'uncheck', 'press', 'hover', 'upload', 'drag', 'extract', 'assert_visible', 'assert_text', 'assert_url', 'wait', 'decision'];
 
 function pickPage(session, url) {
   let pages = [];
@@ -27,6 +30,13 @@ function pickPage(session, url) {
 
 /** Send a node to the recorder (if this page is being recorded) and mute the page's own capture. */
 async function announce(page, node, mute) {
+  // the recorder also runs inside iframes: mute it there too while the agent acts
+  if (mute) {
+    for (const f of page.frames()) {
+      if (f === page.mainFrame()) continue;
+      await f.evaluate(() => { window.__opscodeRecorderMuted = true; }).catch(() => {});
+    }
+  }
   try {
     return await page.evaluate(async ({ n, mute }) => {
       if (mute) window.__opscodeRecorderMuted = true;
@@ -40,13 +50,15 @@ async function announce(page, node, mute) {
 }
 
 async function unmute(page) {
-  try {
-    await page.evaluate(() => {
-      // Values the agent typed are already in its node: do not record them again on blur.
-      document.querySelectorAll('input, textarea').forEach((el) => { el.__opscodeLastRecordedValue = el.value; });
-      window.__opscodeRecorderMuted = false;
-    });
-  } catch {}
+  for (const f of page.frames()) {
+    try {
+      await f.evaluate(() => {
+        // Values the agent typed are already in its node: do not record them again on blur.
+        document.querySelectorAll('input, textarea').forEach((el) => { el.__opscodeLastRecordedValue = el.value; });
+        window.__opscodeRecorderMuted = false;
+      });
+    } catch {}
+  }
 }
 
 async function describeElement(locator) {
@@ -87,7 +99,23 @@ export async function performStep(params = {}, context = {}) {
   let node = null;
   let recorded = false;
   let outcome;
+  let extracted;
+  let dialogNode = null;
+  const cwd = context.cwd || process.cwd();
+  const vars = readVars(cwd);
+  // {{var:name}} in a value: typed resolved, recorded as written (so replays use the variable)
+  const typed = (v) => resolveValue(String(v ?? ''), { vars });
   try {
+    const scope = params.frame ? await scopeFor(page, params.frame, { timeout }) : page;
+    if (params.frame) base.frame = typeof params.frame === 'string' ? (/^[#.[]|^iframe/i.test(params.frame) ? { selector: params.frame } : { name: params.frame, url: undefined, hint: params.frame }) : params.frame;
+    // A dialog this action opens: answer it as asked (default accept) and record it after the action.
+    if (params.dialog != null) {
+      const want = typeof params.dialog === 'object' ? params.dialog : { accept: params.dialog !== 'dismiss' && params.dialog !== false };
+      page.once('dialog', async (d) => {
+        dialogNode = { action: 'dialog', accept: want.accept !== false, text: want.text, dialogType: d.type(), message: d.message().slice(0, 200), description: `${want.accept !== false ? 'Accept' : 'Dismiss'} ${d.type()} "${d.message().slice(0, 40)}"`, source: 'agent', timestamp: Date.now() };
+        try { if (want.accept !== false) await d.accept(want.text != null ? String(want.text) : undefined); else await d.dismiss(); } catch {}
+      });
+    }
     switch (action) {
       case 'goto': {
         let url = params.url || params.value;
@@ -95,7 +123,30 @@ export async function performStep(params = {}, context = {}) {
         if (!/^https?:\/\//i.test(url) && !url.startsWith('file://') && url !== 'about:blank') url = 'https://' + url;
         node = { ...base, url, description: base.description || `Navigate to ${url}` };
         recorded = await announce(page, node, false);
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await page.goto(typed(url), { waitUntil: 'domcontentloaded', timeout: 30000 });
+        break;
+      }
+      case 'extract': {
+        if (!params.name) throw new Error('extract needs "name" (the variable to set), and "target" and/or "pattern".');
+        const loc = params.target ? locatorFromTarget(scope, params.target) : scope.locator('body');
+        await loc.waitFor({ state: 'visible', timeout });
+        const selectorSet = params.target ? await describeElement(loc) : null;
+        extracted = extractFrom(await loc.innerText({ timeout }), params.pattern);
+        node = { ...base, selectorSet: selectorSet || (params.target ? { cssSelector: typeof params.target === 'string' ? params.target : null } : null), target: params.target, pattern: params.pattern || undefined, name: params.name, description: base.description || `Read ${params.name}` };
+        if (!node.label) node.label = `Read "${params.name}"`;
+        recorded = await announce(page, node, false);
+        saveVars(cwd, { [params.name]: extracted });
+        break;
+      }
+      case 'drag': {
+        const from = locatorFromTarget(scope, params.target);
+        const to = locatorFromTarget(scope, params.to);
+        await from.waitFor({ state: 'visible', timeout });
+        await to.waitFor({ state: 'visible', timeout });
+        node = { ...base, selectorSet: await describeElement(from), to: await describeElement(to), target: params.target };
+        if (!node.label) node.label = defaultLabel(node);
+        recorded = await announce(page, node, true);
+        await from.dragTo(to, { timeout });
         break;
       }
       case 'click':
@@ -104,9 +155,12 @@ export async function performStep(params = {}, context = {}) {
       case 'check':
       case 'uncheck':
       case 'press':
+      case 'hover':
+      case 'upload':
       case 'assert_visible': {
-        const loc = locatorFromTarget(page, params.target);
-        await loc.waitFor({ state: 'visible', timeout });
+        const loc = locatorFromTarget(scope, params.target);
+        if (action === 'upload') await loc.waitFor({ state: 'attached', timeout });
+        else await loc.waitFor({ state: 'visible', timeout });
         const selectorSet = await describeElement(loc);
         node = {
           ...base,
@@ -118,11 +172,18 @@ export async function performStep(params = {}, context = {}) {
         if (action === 'fill' && params.sensitive) node.sensitive = true;
         if (action === 'fill') node.fieldName = params.fieldName || selectorSet?.domContext?.label || undefined;
         if ((action === 'fill' || action === 'select') && params.data != null) node.data = normalizeRule(params.data);
+        if ((action === 'fill' || action === 'select') && params.exportAs) node.exportAs = String(params.exportAs);
+        if (action === 'upload') node.files = (Array.isArray(params.files) ? params.files : [params.files || params.value]).filter(Boolean).map(String);
         if (!node.label) node.label = defaultLabel(node);
         recorded = await announce(page, node, true);
         if (action === 'click') await robustClick(page, loc, { timeout });
-        else if (action === 'fill') await robustFill(loc, params.value, { timeout });
-        else if (action === 'select') await loc.selectOption(String(params.value ?? ''), { timeout });
+        else if (action === 'fill') await robustFill(loc, typed(params.value), { timeout });
+        else if (action === 'select') await loc.selectOption(typed(params.value), { timeout });
+        else if (action === 'hover') await loc.hover({ timeout });
+        else if (action === 'upload') {
+          if (!node.files.length) throw new Error('upload needs "files": file names in automation/files/ or paths.');
+          await loc.setInputFiles(resolveUploadFiles(cwd, node.files).paths, { timeout });
+        }
         else if (action === 'check' || action === 'uncheck') {
           const want = action === 'check';
           if ((await loc.isChecked()) !== want) await robustClick(page, loc, { timeout });
@@ -166,6 +227,9 @@ export async function performStep(params = {}, context = {}) {
     }
     await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
     await page.waitForTimeout(300);
+    if (dialogNode) await announce(page, dialogNode, false);
+    // a value this fill publishes is usable at once by later steps
+    if (node?.exportAs && params.value != null) saveVars(cwd, { [node.exportAs]: typed(params.value) });
   } catch (err) {
     await unmute(page);
     return { ok: false, text: `Step "${action}" failed: ${err.message}`, data: { action, url: page.url(), recorded } };
@@ -178,11 +242,13 @@ export async function performStep(params = {}, context = {}) {
   const where = page.url();
   const parts = [`${recorded ? 'Recorded' : 'Did'}: ${label}${node?.description && node.description !== label ? ` (${node.description})` : ''}`];
   if (action === 'decision') parts.push(`Condition is ${outcome ? 'TRUE' : 'FALSE'}: the next steps go on the "${outcome ? 'yes' : 'no'}" branch.`);
+  if (action === 'extract') parts.push(`${params.name} = "${extracted}" (use it as {{var:${params.name}}})`);
+  if (dialogNode) parts.push(`Dialog: ${dialogNode.description}`);
   parts.push(`Page now: ${where}`);
   if (!recording) parts.push('(No recording is running, so this step was not saved. Start one with automation_record_start.)');
   return {
     ok: true,
     text: parts.join('\n'),
-    data: { action, label, recorded, outcome, url: where, title: await page.title().catch(() => '') },
+    data: { action, label, recorded, outcome, value: extracted, dialog: dialogNode || undefined, url: where, title: await page.title().catch(() => '') },
   };
 }

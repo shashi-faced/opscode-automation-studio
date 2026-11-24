@@ -39,6 +39,16 @@ be replayed with self-healing selectors. The Opscode Graph tab shows it all, liv
   said, failed requests, console errors, data used, screenshot, how to reproduce. open → fixed
   (developer) → closed by the next passing run; a failure after that reopens it as a regression.
 
+- **More actions** (part 3): hover, upload (files in `automation/files/`, placeholders made when
+  missing), drag, extract (a value on the page into a variable), browser dialogs (recorded and
+  answered), steps inside iframes (`frame`).
+- **Server checks.** Data-changing requests after an action are saved on its node while recording
+  (`requests`); replay requires the same call to happen and succeed.
+- **Variables** (`src/data/vars.mjs`): `exportAs` on a fill, `extract` steps, `{{var:name}}` in
+  values and URLs, rule mode `var`; kept in `automation/data/vars.json` so flows can be chained.
+- **Negative tests** (`src/data/negative.mjs`), **CSV data sets**, **cleanup** of created records,
+  **GitHub issues**, **run history**, **explore** and **Playwright export** (`src/moreTools.mjs`).
+
 ## Tools
 
 | Tool | What it does |
@@ -49,9 +59,15 @@ be replayed with self-healing selectors. The Opscode Graph tab shows it all, liv
 | `automation_record_status` | Live state of the recording, including its graph |
 | `automation_record_stop` | Save the flow (+ Playwright spec) under its feature (`rejoin` for branches) |
 | `automation_flow_get` | A saved flow's nodes and edges, and its last run |
-| `automation_flow_run` | Replay a flow (`data`: fresh/recorded, `times`, `replayRun`, `inputs`, `untilNode`, `fromNode`) |
+| `automation_flow_run` | Replay a flow (`data`: fresh/recorded, `times`, `replayRun`, `dataset` CSV, `inputs`, `untilNode`, `fromNode`) |
 | `automation_flow_data` | Show or change the test data rule of each form field, with sample values |
 | `automation_issues` / `automation_issue_update` | List tracked failures; mark fixed / won't fix, note, assignee |
+| `automation_flow_negative` | Wrong and boundary values per field; accepted ones become issues |
+| `automation_cleanup` | Delete records runs created (cleanup flow or HTTP request) |
+| `automation_issue_export` / `automation_issue_sync` | GitHub issue for a tracked issue; closed there = fixed here |
+| `automation_run_history` | Pass rate, last runs, flaky / failing / slow steps per flow |
+| `automation_explore` | Crawl an app, list pages and forms, propose (and lay out) features and flows |
+| `automation_export` | Playwright project (one test per flow and branch path) with a CI workflow |
 | `automation_batch_run` | Run all flows of a feature in dependency order |
 | `automation_flow_match` | Find a saved flow for a request |
 | `automation_graph_get` / `_save` | Module graph (project, features, flows, layout, dependencies) |

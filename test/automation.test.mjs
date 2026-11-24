@@ -303,7 +303,7 @@ test('5. Automation Studio Doctor', async () => {
 });
 
 test('6. Tool Definitions & CLI Tool Runner', async (t) => {
-  await t.test('TOOL_DEFS defines all 21 tools with valid parameters', () => {
+  await t.test('TOOL_DEFS defines all 28 tools with valid parameters', () => {
     const expected = [
       'automation_record_start',
       'automation_record_stop',
@@ -326,6 +326,13 @@ test('6. Tool Definitions & CLI Tool Runner', async (t) => {
       'automation_flow_data',
       'automation_issues',
       'automation_issue_update',
+      'automation_flow_negative',
+      'automation_cleanup',
+      'automation_issue_export',
+      'automation_issue_sync',
+      'automation_run_history',
+      'automation_explore',
+      'automation_export',
     ];
     const names = TOOL_DEFS.map(t => t.name);
     assert.deepEqual(names.sort(), expected.sort());

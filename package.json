@@ -1,6 +1,6 @@
 {
   "name": "@opscode/automation-studio",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Opscode Automation Studio agent: self-healing browser automation, interactive DOM recorder, visual diffing and WCAG accessibility audits.",
   "type": "module",
   "bin": {

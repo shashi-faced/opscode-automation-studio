@@ -174,6 +174,80 @@ export function recordRunIssues(cwd, flow, run) {
   return out;
 }
 
+/**
+ * Record a finding that is not a failed step (e.g. the app accepted an invalid value, or a script
+ * typed into a field ran). Same fingerprint = same issue. Returns { id, opened, reopened }.
+ */
+export function recordFinding(cwd, flow, f) {
+  const store = loadIssues(cwd);
+  const now = new Date().toISOString();
+  const flowId = flow.id || f.flowId;
+  const fp = `${flowId}|${f.nodeId}|${f.category}|${f.key || errorShape(f.error)}`;
+  const runRef = { runId: f.runId, at: now, status: 'fail', runDir: f.runDir ? path.relative(cwd, f.runDir) : null, screenshot: null, dataMode: 'negative' };
+  let issue = store.issues.find((i) => i.fingerprint === fp);
+  let opened = false, reopened = false;
+  if (issue) {
+    issue.occurrences = (issue.occurrences || 1) + 1;
+    issue.lastSeen = now;
+    issue.lastRun = runRef;
+    issue.runs = [...(issue.runs || []), runRef].slice(-20);
+    issue.dataUsed = f.dataUsed || issue.dataUsed;
+    if (issue.status === 'fixed' || issue.status === 'closed') {
+      issue.history.push({ at: now, status: 'open', by: 'run', note: `Found again by ${f.runId}: regression.` });
+      issue.status = 'open';
+      issue.regression = true;
+      reopened = true;
+    }
+  } else {
+    issue = {
+      id: `ISS-${String(store.nextNumber++).padStart(4, '0')}`,
+      fingerprint: fp,
+      status: 'open',
+      severity: f.severity || 'medium',
+      category: f.category,
+      title: f.title,
+      hint: f.hint || '',
+      flow: { id: flowId, name: flow.name || flowId, feature: flow.feature || null, path: f.flowPath ? path.relative(cwd, f.flowPath) : null },
+      node: { id: f.nodeId, label: f.label || '', action: f.action || 'fill', description: '' },
+      error: String(f.error || '').slice(0, 600),
+      pageUrl: f.pageUrl || null,
+      pageMessages: [],
+      failedRequests: [],
+      consoleErrors: [],
+      dataUsed: f.dataUsed || [],
+      reproduce: f.reproduce || '',
+      firstSeen: now,
+      lastSeen: now,
+      occurrences: 1,
+      lastRun: runRef,
+      runs: [runRef],
+      assignee: null,
+      history: [{ at: now, status: 'open', by: 'run', note: `Opened by ${f.runId}` }],
+    };
+    store.issues.push(issue);
+    opened = true;
+  }
+  saveIssues(cwd, store);
+  return { id: issue.id, opened, reopened };
+}
+
+/** A finding that is fine now (the app rejects the value again): a "fixed" issue is closed. */
+export function resolveFinding(cwd, flowId, nodeId, category, key, runId) {
+  const store = loadIssues(cwd);
+  const issue = store.issues.find((i) => i.fingerprint === `${flowId}|${nodeId}|${category}|${key}`);
+  if (!issue || (issue.status !== 'fixed' && issue.status !== 'open')) return null;
+  const now = new Date().toISOString();
+  if (issue.status === 'fixed') {
+    issue.status = 'closed';
+    issue.closedAt = now;
+    issue.history.push({ at: now, status: 'closed', by: 'run', note: `Verified: ${runId} found it fixed.` });
+  } else {
+    issue.lastPassed = { runId, at: now };
+  }
+  saveIssues(cwd, store);
+  return issue.id;
+}
+
 export function listIssues(cwd, { status, flow, all = false } = {}) {
   const store = loadIssues(cwd);
   let list = store.issues;
